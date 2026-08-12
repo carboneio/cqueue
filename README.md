@@ -14,18 +14,22 @@ Zero-dependency concurrent queue executor for Node.js. Split a list of elements 
 
 ## Install
 
-The package is not published on npm: install it directly from GitHub, pinned to a tag:
+The package is not published on npm: install it directly from GitHub, pinned to an exact commit SHA (immutable, tags can be moved but commits cannot):
 
 ```bash
-npm install github:carboneio/cqueue#v1
+npm install github:carboneio/cqueue#9b1d86a61047881dcb64c9841a140854ea246976
 ```
-
-To upgrade, point the dependency to a newer tag and run `npm install` again:
 
 ```json
 "dependencies": {
-  "cqueue": "github:carboneio/cqueue#v1"
+  "cqueue": "github:carboneio/cqueue#9b1d86a61047881dcb64c9841a140854ea246976"
 }
+```
+
+To upgrade, replace the SHA with the commit of the release you want and run `npm install` again. Get the SHA of the latest release with:
+
+```bash
+git ls-remote https://github.com/carboneio/cqueue.git v1
 ```
 
 ## Quick start
