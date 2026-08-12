@@ -1,5 +1,5 @@
 {
-  "name": "cqueue",
+  "name": "@carboneio/cqueue",
   "version": "1.0.0",
   "description": "Zero-dependency concurrent queue executor: parallel queues, retries, rate limiting, progress and performance stats",
   "keywords": [
@@ -17,15 +17,24 @@
     "type": "git",
     "url": "git+https://github.com/carboneio/cqueue.git"
   },
-  "private": true,
+  "homepage": "https://github.com/carboneio/cqueue#readme",
+  "bugs": {
+    "url": "https://github.com/carboneio/cqueue/issues"
+  },
   "type": "commonjs",
   "main": "cqueue.js",
+  "files": [
+    "cqueue.js"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "test": "node --test",
     "test:unit": "node --test test/cqueue.test.js",
     "test:perf": "node --test test/cqueue.perf.test.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   }
 }

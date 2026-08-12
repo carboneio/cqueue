@@ -14,28 +14,14 @@ Zero-dependency concurrent queue executor for Node.js. Split a list of elements 
 
 ## Install
 
-The package is not published on npm: install it directly from GitHub, pinned to an exact commit SHA (immutable, tags can be moved but commits cannot):
-
 ```bash
-npm install github:carboneio/cqueue#9b1d86a61047881dcb64c9841a140854ea246976
-```
-
-```json
-"dependencies": {
-  "cqueue": "github:carboneio/cqueue#9b1d86a61047881dcb64c9841a140854ea246976"
-}
-```
-
-To upgrade, replace the SHA with the commit of the release you want and run `npm install` again. Get the SHA of the latest release with:
-
-```bash
-git ls-remote https://github.com/carboneio/cqueue.git v1
+npm install @carboneio/cqueue
 ```
 
 ## Quick start
 
 ```js
-const { execQueue } = require('cqueue');
+const { execQueue } = require('@carboneio/cqueue');
 
 const files = ['a.pdf', 'b.pdf', 'c.pdf' /* ... thousands more */];
 
@@ -113,7 +99,7 @@ execQueue('sync-users', users, (user, next) => {
 Replace the default logger (`console.log`) with your own `(message, level) => {}`. Used by all internal logs (start/end summaries, error counts, file creation).
 
 ```js
-const { setLogFunction } = require('cqueue');
+const { setLogFunction } = require('@carboneio/cqueue');
 setLogFunction((msg) => myLogger.info(msg));
 ```
 
@@ -145,7 +131,7 @@ When elements fail, or when workers provide `actions.logs`, a JSON file is writt
 ## Exports
 
 ```js
-const { execQueue, msToTime, chunkify, setLogFunction, NS_PER_SEC, MS_PER_NS } = require('cqueue');
+const { execQueue, msToTime, chunkify, setLogFunction, NS_PER_SEC, MS_PER_NS } = require('@carboneio/cqueue');
 ```
 
 ## Tests

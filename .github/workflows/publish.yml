@@ -1,0 +1,33 @@
+name: Publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Required for the OIDC exchange with npm (trusted publishing) and provenance
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js 26
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26
+          registry-url: https://registry.npmjs.org
+
+      - name: Run tests
+        run: npm test
+
+      # Trusted publishing (OIDC): no token or secret needed, npm authenticates the
+      # workflow itself and generates the provenance attestation automatically.
+      # Requires npm >= 11.5.1 (bundled with recent Node versions).
+      - name: Publish to npm
+        run: npm publish
