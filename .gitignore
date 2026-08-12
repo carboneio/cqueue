@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Generated queue error/log files
+logs/
+*.log
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# npm/yarn debug and lock leftovers
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment files
+.env
+.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

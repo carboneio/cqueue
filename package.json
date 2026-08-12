@@ -1,0 +1,31 @@
+{
+  "name": "cqueue",
+  "version": "1.0.0",
+  "description": "Zero-dependency concurrent queue executor: parallel queues, retries, rate limiting, progress and performance stats",
+  "keywords": [
+    "queue",
+    "concurrency",
+    "parallel",
+    "batch",
+    "retry",
+    "throttle",
+    "worker"
+  ],
+  "license": "Apache-2.0",
+  "author": "carboneio",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/carboneio/cqueue.git"
+  },
+  "private": true,
+  "type": "commonjs",
+  "main": "cqueue.js",
+  "scripts": {
+    "test": "node --test",
+    "test:unit": "node --test test/cqueue.test.js",
+    "test:perf": "node --test test/cqueue.perf.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
