@@ -203,13 +203,15 @@ function printStatusPlain (lists, state, force) {
   if (_shouldPrint === false) {
     return;
   }
-  let _text = '';
+  const _lines = [];
   state.percents = [];
   for (let i = 0; i < lists.length; i++) {
     state.percents.push(lists[i].time.percentage);
-    _text += getStatusLine(lists[i]) + '\n';
+    _lines.push(getStatusLine(lists[i]));
   }
-  process.stdout.write(_text);
+  /** Routed through log(): without a TTY the progress must reach the logger configured
+   * with setLogFunction, and not only the stdout of the process */
+  log(_lines.join('\n'), 'info');
 }
 
 function eraseStatus () {
@@ -273,6 +275,8 @@ async function execQueue (queueName, list, functionToExecute, options, callback)
       retry         : options?.retry ?? 1, // Option - Number of retries if an error is thrown
       logEnabled    : options?.logEnabled ?? true, // Option - Log Start and End Performance summary, if false errors are still logged
       logQueueStatus: options?.logQueueStatus ?? true, // Option - Log on the console each queue status and performances
+      logDir        : path.resolve(options?.logDir ?? path.join(process.cwd(), 'logs')), // Option - directory of the error/log files, resolved once so a later chdir cannot move it
+      logRetention  : options?.logRetention ?? 0, // Option - max number of files kept per queue name and label, 0 keeps them all
       try           : options?.try ?? 0, // Internal - current retry attempt
       results       : options?.results ? [...options.results] : [] // Internal - results accumulator across retries
     };
@@ -324,13 +328,14 @@ async function execQueue (queueName, list, functionToExecute, options, callback)
       options.results.push(_results[i]);
     }
     if (_logs.length > 0) {
-      createLogFile(queueName, _logs, 'logs', options.try);
+      /** Awaited: a caller exiting right after the callback must not truncate the file */
+      await createLogFile(queueName, _logs, 'logs', options);
     }
     if (_errors.length > 0) {
       /** The distinct messages are logged inline: the failure is diagnosable from the log
        * alone, without opening the error file */
       log(`[${queueName}] ${_errors.length} errors: ${getErrorSummary(_errors)}`, 'error')
-      createLogFile(queueName, _errors, 'errors', options.try, 'error');
+      await createLogFile(queueName, _errors, 'errors', options, 'error');
       const _toRetry = _errors.map(value => value.element);
       if (options.try < options.retry) {
         options.try += 1;
@@ -385,42 +390,143 @@ function getErrorSummary (errors) {
   return _summary.join(', ');
 }
 
-function createLogFile(queueName, content, label, attempt, level = 'info') {
+function getQueueSlug (queueName) {
+  /** Whitelist: the queue name is part of a file name. A path separator, a null byte or a
+   * `..` segment would let a name coming from untrusted data escape the log directory */
+  return queueName.replace(/\s/g, '-').toLowerCase().replace(/[^a-z0-9._-]/g, '-');
+}
+
+function escapeRegExp (str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Write the errors or the logs of a queue as a JSON file
+ *
+ * @param {String} queueName Name of the queue
+ * @param {Array} content Elements to serialize
+ * @param {String} label `errors` or `logs`, part of the file name
+ * @param {Object} options Normalized options (try, logDir, logRetention)
+ * @param {String} level [OPTIONAL] Level used to log the path of the created file
+ * @returns {Promise} Resolved once the file is fully written and the retention applied.
+ *                    Never rejected: a write failure is logged and the queue results are kept
+ */
+function createLogFile (queueName, content, label, options, level = 'info') {
   /** Second precision + retry attempt suffix: a retry executed in the same minute does not overwrite the previous file */
-  const _suffix = attempt > 0 ? `-try${attempt}` : '';
-  const _filename = new Date().toISOString().replace(/:/g, '-').slice(0, 19) + `-${queueName.replace(/\s/g, '-').toLowerCase()}${label ? '-' + label : ''}${_suffix}.json`
-  const _dir = path.join(process.cwd(), 'logs');
-  const _path = path.join(_dir, _filename);
+  const _suffix = options.try > 0 ? `-try${options.try}` : '';
+  const _filename = new Date().toISOString().replace(/:/g, '-').slice(0, 19) + `-${getQueueSlug(queueName)}${label ? '-' + label : ''}${_suffix}.json`
+  const _path = path.join(options.logDir, _filename);
   /** The path is logged at the level of its content: an error file must not be stranded at info */
   log(`[${queueName}] Created ${label ? label + ' ' : ''}file: ${_path}`, level);
 
-  try {
-    fs.mkdirSync(_dir, { recursive: true });
-  } catch (err) {
-    return log(`[${queueName}] Error Create Log Folder: ${err.toString()}`, 'error');
-  }
-  const _stream = fs.createWriteStream(_path);
-  _stream.on('error', (err) => {
-    log(`[${queueName}] Error Create Log File: ${err.toString()}`, 'error');
+  return new Promise(function (resolve) {
+    /** Second guard, in case the name sanitizing ever lets something through: the file is
+     * always written directly inside the log directory, never in a parent or a sub folder */
+    if (path.dirname(_path) !== options.logDir) {
+      log(`[${queueName}] Error Create Log File: ${_path} is outside of ${options.logDir}`, 'error');
+      return resolve();
+    }
+    try {
+      fs.mkdirSync(options.logDir, { recursive: true });
+    } catch (err) {
+      log(`[${queueName}] Error Create Log Folder: ${err.toString()}`, 'error');
+      return resolve();
+    }
+    /** 'wx' fails instead of following a symlink or overwriting a file planted in the log
+     * directory, and turns a same-second collision into an error instead of a corrupted file */
+    const _stream = fs.createWriteStream(_path, { flags: 'wx' });
+    /** The queue awaits this promise: it must settle exactly once, on 'finish' as on 'error' */
+    let _settled = false;
+    _stream.on('error', (err) => {
+      log(`[${queueName}] Error Create Log File: ${err.toString()}`, 'error');
+      if (_settled === false) {
+        _settled = true;
+        return resolve();
+      }
+    });
+    _stream.on('finish', () => {
+      if (_settled === false) {
+        _settled = true;
+        return removeOldLogFiles(queueName, label, options, resolve);
+      }
+    });
+    let _index = 0;
+    /** The content is serialized chunk by chunk with backpressure: one JSON.stringify of a
+     * huge errors/logs array would block the event loop and buffer the whole file in memory */
+    function writeNextChunk () {
+      let _buffer = _index === 0 ? '[' : '';
+      const _end = Math.min(_index + LOG_FILE_CHUNK_SIZE, content.length);
+      for (; _index < _end; _index++) {
+        let _json;
+        /** A circular structure or a BigInt makes JSON.stringify throw: serialized as null,
+         * like any other non-serializable entry, instead of crashing from a setImmediate */
+        try {
+          _json = JSON.stringify(content[_index]);
+        } catch (err) {
+          _json = 'null';
+        }
+        _buffer += (_json ?? 'null') + (_index + 1 < content.length ? ',' : '');
+      }
+      if (_index >= content.length) {
+        return _stream.end(_buffer + ']');
+      }
+      if (_stream.write(_buffer) === false) {
+        return _stream.once('drain', writeNextChunk);
+      }
+      return setImmediate(writeNextChunk);
+    }
+    writeNextChunk();
   });
-  let _index = 0;
-  /** The content is serialized chunk by chunk with backpressure: one JSON.stringify of a
-   * huge errors/logs array would block the event loop and buffer the whole file in memory */
-  function writeNextChunk () {
-    let _buffer = _index === 0 ? '[' : '';
-    const _end = Math.min(_index + LOG_FILE_CHUNK_SIZE, content.length);
-    for (; _index < _end; _index++) {
-      _buffer += (JSON.stringify(content[_index]) ?? 'null') + (_index + 1 < content.length ? ',' : '');
-    }
-    if (_index >= content.length) {
-      return _stream.end(_buffer + ']');
-    }
-    if (_stream.write(_buffer) === false) {
-      return _stream.once('drain', writeNextChunk);
-    }
-    return setImmediate(writeNextChunk);
+}
+
+/**
+ * Delete the oldest files of the same queue and label, keeping `options.logRetention` of them
+ * A cleanup failure is not a queue failure: it is logged as a warning and never blocks the callback
+ *
+ * @param {String} queueName Name of the queue
+ * @param {String} label `errors` or `logs`
+ * @param {Object} options Normalized options (logDir, logRetention)
+ * @param {Function} callback Called once the cleanup is done
+ */
+function removeOldLogFiles (queueName, label, options, callback) {
+  if (!(options.logRetention > 0)) {
+    return callback();
   }
-  writeNextChunk();
+  fs.readdir(options.logDir, (err, files) => {
+    if (err) {
+      log(`[${queueName}] Error Read Log Folder: ${err.toString()}`, 'warn');
+      return callback();
+    }
+    /** Only the files of this queue and label: another queue, or another program writing
+     * in the same folder, is never touched */
+    const _pattern = new RegExp(`^(.{19})-${escapeRegExp(getQueueSlug(queueName))}${label ? '-' + label : ''}(?:-try(\\d+))?\\.json$`);
+    const _files = [];
+    for (let i = 0; i < files.length; i++) {
+      const _match = _pattern.exec(files[i]);
+      if (_match !== null) {
+        _files.push({ name: files[i], date: _match[1], try: _match[2] !== undefined ? Number(_match[2]) : 0 });
+      }
+    }
+    if (_files.length <= options.logRetention) {
+      return callback();
+    }
+    /** Oldest first: the ISO timestamp prefix sorts lexicographically and the retry number breaks
+     * the ties of rounds written within the same second */
+    _files.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : a.try - b.try);
+    const _toRemove = _files.slice(0, _files.length - options.logRetention);
+    let _pending = _toRemove.length;
+    for (let i = 0; i < _toRemove.length; i++) {
+      fs.unlink(path.join(options.logDir, _toRemove[i].name), (err) => {
+        if (err) {
+          log(`[${queueName}] Error Remove Log File: ${err.toString()}`, 'warn');
+        }
+        _pending -= 1;
+        if (_pending === 0) {
+          return callback();
+        }
+      });
+    }
+  });
 }
 
 function chunkify(list, size, logQueueStatus) {

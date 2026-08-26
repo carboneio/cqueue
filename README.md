@@ -49,7 +49,7 @@ const { results, errors } = await execQueue('convert-files', files, worker, { co
 
 | Argument | Type | Description |
 |---|---|---|
-| `queueName` | `String` | Name used in logs and generated file names |
+| `queueName` | `String` | Name used in logs and generated file names. Reduced to `[a-z0-9._-]` in file names, so a name built from untrusted data cannot escape `logDir` |
 | `list` | `Array` | Elements to process (objects, strings, numbers…) |
 | `functionToExecute` | `Function` | Worker `(element, next) => {}` executed for each element |
 | `options` | `Object` | Optional, see below |
@@ -63,7 +63,9 @@ const { results, errors } = await execQueue('convert-files', files, worker, { co
 | `delay` | `Number` | `0` | Milliseconds to wait between each execution in a queue (rate limiting). With `0`, elements completing synchronously are executed in batches that yield back to the event loop every few milliseconds: no artificial delay, no event loop starvation |
 | `retry` | `Number` | `1` | Number of extra rounds re-executing only the failed elements. `0` disables retries |
 | `logEnabled` | `Boolean` | `true` | Log the START line and the END performance summary. Errors are still logged when `false` |
-| `logQueueStatus` | `Boolean` | `true` | Live per-queue progress on stdout (`[0] 45% - 45/100 - Passed time: 2.1 Sec \| Left Time: 2.5 Sec \| Avg time/exec: 47 ms`). See [Live status rendering](#live-status-rendering) |
+| `logDir` | `String` | `<cwd>/logs` | Directory of the generated error / log JSON files, created if missing. Set it to an absolute path so the files do not depend on the directory the process was started from |
+| `logRetention` | `Number` | `0` | Maximum number of files kept per queue name and label (`errors`, `logs`); the oldest ones are deleted after each successful write. `0` keeps every file. Only the files of that queue and label are ever deleted |
+| `logQueueStatus` | `Boolean` | `true` | Live per-queue progress (`[0] 45% - 45/100 - Passed time: 2.1 Sec \| Left Time: 2.5 Sec \| Avg time/exec: 47 ms`). See [Live status rendering](#live-status-rendering) |
 
 #### Callback / promise result
 
@@ -126,7 +128,7 @@ Split a list into `size` balanced chunk descriptors (used internally, exported f
 With `logQueueStatus: true`, the per-queue status block is rendered:
 
 - **On a TTY**: repainted in place at most every 200ms (single atomic write, cursor hidden during the repaint, lines cleared and truncated to the terminal width). cqueue's own log messages are printed *above* the live block without corrupting it. Avoid `console.log` from your worker while a status block is active — printing through an external logger via `setLogFunction`, or after completion, keeps the display intact
-- **Without a TTY** (CI, piped output): a plain status block is printed only when a queue progresses by 10%, plus one final block, so logs are not flooded
+- **Without a TTY** (CI, piped output): a plain status block is printed only when a queue progresses by 10%, plus one final block, so logs are not flooded. It goes through the function registered with `setLogFunction` (at the `info` level), so the progress reaches the host's log file like every other message
 
 ## Error and log files
 
@@ -136,12 +138,22 @@ Each failed round logs the distinct error messages with their number of occurren
 [convert-files] 12 errors: "Error: connect ECONNREFUSED" x9, "Error: ETIMEDOUT" x2, +1 more
 ```
 
-When elements fail, or when workers provide `actions.logs`, a JSON file is written to `<current working directory>/logs/` (created automatically). Files are serialized and written with a chunked streaming writer, so a huge errors/logs array never blocks the event loop:
+When elements fail, or when workers provide `actions.logs`, a JSON file is written to the `logDir` directory (`<current working directory>/logs/` by default, created automatically). Files are serialized and written with a chunked streaming writer, so a huge errors/logs array never blocks the event loop:
 
 ```
 2026-08-12T14-05-33-my-queue-errors.json       ← failures of the first attempt
 2026-08-12T14-05-35-my-queue-errors-try1.json  ← failures of retry round 1
 2026-08-12T14-05-35-my-queue-logs.json         ← collected actions.logs
+```
+
+Files are created with the `wx` flag: the queue never follows a symlink nor overwrites an existing file in `logDir`. Two runs of the same queue name colliding within the same second log an error instead of corrupting each other's file.
+
+The queue waits for these files to be fully written before calling back, so a caller exiting immediately — `execQueue(..., () => process.exit())` — always gets a complete file. A file that cannot be written is logged at the `error` level and never discards the results or the errors returned to the caller.
+
+Use `logRetention` to bound the directory:
+
+```js
+execQueue('convert-files', files, worker, { logDir: '/var/log/myapp', logRetention: 10 });
 ```
 
 ## Exports

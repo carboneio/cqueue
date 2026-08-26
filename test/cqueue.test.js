@@ -44,6 +44,13 @@ async function waitForLogFile (namePart, timeoutMs = 2000) {
   return null;
 }
 
+const CQUEUE_PATH = path.join(__dirname, '..', 'cqueue.js');
+
+/** A dedicated empty folder, used as the `logDir` option */
+function tmpLogDir () {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'cqueue-logdir-'));
+}
+
 /** Promise wrapper to keep tests flat */
 function execQueueP (queueName, list, functionToExecute, options) {
   return new Promise((resolve, reject) => {
@@ -458,6 +465,226 @@ describe('execQueue', () => {
       /** The default output marks the error level and keeps the message otherwise unchanged */
       assert.ok(_written.some(l => l === 'ERROR [default-output] 1 errors: "Error: boom" x1'), _written.join('\n'));
       assert.ok(_written.some(l => l.startsWith('ERROR [default-output] Created errors file:')), _written.join('\n'));
+    });
+  });
+
+  describe('log file completion', () => {
+    it('should have fully written the error file when the callback is called', async () => {
+      const _dir = tmpLogDir();
+      const _list = Array.from({ length: 5000 }, (_, i) => `bad-${i}`);
+      await execQueueP('complete-errors', _list, (el, next) => next(new Error(el)), silentOptions({ retry: 0, logDir: _dir }));
+      /** No polling: the file must already be complete and parseable when the queue calls back */
+      const _file = fs.readdirSync(_dir).find(f => f.includes('complete-errors-errors'));
+      assert.ok(_file, 'error file not found');
+      const _content = JSON.parse(fs.readFileSync(path.join(_dir, _file), 'utf8'));
+      assert.strictEqual(_content.length, 5000);
+    });
+
+    it('should have fully written the logs file when the callback is called', async () => {
+      const _dir = tmpLogDir();
+      const _entries = Array.from({ length: 5000 }, (_, i) => ({ id: i }));
+      await execQueueP('complete-logs', [1], (el, next) => next(null, el, { logs: _entries }), silentOptions({ logDir: _dir }));
+      const _file = fs.readdirSync(_dir).find(f => f.includes('complete-logs-logs'));
+      assert.ok(_file, 'log file not found');
+      const _content = JSON.parse(fs.readFileSync(path.join(_dir, _file), 'utf8'));
+      assert.strictEqual(_content.length, 5000);
+    });
+
+    it('should write a complete error file when the caller exits from the callback', () => {
+      const { spawnSync } = require('child_process');
+      const _dir = tmpLogDir();
+      /** The regression: a CLI exiting from the callback used to truncate the chunked write */
+      const _script = `
+        const { execQueue, setLogFunction } = require(${JSON.stringify(CQUEUE_PATH)});
+        setLogFunction(() => {});
+        const list = Array.from({ length: 5000 }, (_, i) => 'bad-' + i);
+        execQueue('exit-queue', list, (el, next) => next(new Error(el)), { logEnabled: false, logQueueStatus: false, retry: 0, logDir: ${JSON.stringify(_dir)} }, () => process.exit(0));
+      `;
+      const _res = spawnSync(process.execPath, ['-e', _script], { encoding: 'utf8', timeout: 30000 });
+      assert.strictEqual(_res.status, 0, _res.stderr);
+      const _file = fs.readdirSync(_dir).find(f => f.includes('exit-queue-errors'));
+      assert.ok(_file, 'error file not found');
+      const _content = JSON.parse(fs.readFileSync(path.join(_dir, _file), 'utf8'));
+      assert.strictEqual(_content.length, 5000);
+    });
+
+    it('should return the results and the errors when the file cannot be written', async (t) => {
+      if (process.getuid && process.getuid() === 0) {
+        return t.skip('root bypasses the folder permissions');
+      }
+      const _dir = tmpLogDir();
+      fs.chmodSync(_dir, 0o500);
+      try {
+        const { results, errors } = await execQueueP('nowrite', ['ok', 'bad'], (el, next) => {
+          return el === 'bad' ? next(new Error('boom')) : next(null, el);
+        }, silentOptions({ retry: 0, logDir: _dir }));
+        /** A write failure must not swallow the results, nor hang the queue */
+        assert.deepStrictEqual(results, ['ok']);
+        assert.strictEqual(errors.length, 1);
+      } finally {
+        fs.chmodSync(_dir, 0o700);
+      }
+      assert.strictEqual(levelOf('Error Create Log File:'), 'error');
+    });
+  });
+
+  describe('logDir option', () => {
+    it('should write the files in the given directory', async () => {
+      const _dir = tmpLogDir();
+      await execQueueP('custom-dir', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir }));
+      assert.ok(fs.readdirSync(_dir).some(f => f.includes('custom-dir-errors')));
+      /** The default `<cwd>/logs` folder is not used any more for this queue */
+      assert.ok(!fs.readdirSync(path.join(process.cwd(), 'logs')).some(f => f.includes('custom-dir-errors')));
+    });
+
+    it('should create the directory when it does not exist', async () => {
+      const _dir = path.join(tmpLogDir(), 'nested', 'queue-logs');
+      await execQueueP('nested-dir', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir }));
+      assert.ok(fs.readdirSync(_dir).some(f => f.includes('nested-dir-errors')));
+    });
+
+    it('should log the path of the given directory', async () => {
+      const _dir = tmpLogDir();
+      await execQueueP('logged-dir', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir }));
+      assert.ok(_capturedLogs.some(l => l.includes(`Created errors file: ${path.join(_dir, '')}`)));
+    });
+  });
+
+  describe('logRetention option', () => {
+    it('should keep every file by default', async () => {
+      const _dir = tmpLogDir();
+      await execQueueP('kept-all', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 2, logDir: _dir }));
+      /** 1 initial round + 2 retries */
+      assert.strictEqual(fs.readdirSync(_dir).filter(f => f.includes('kept-all-errors')).length, 3);
+    });
+
+    it('should keep only the last files of the queue', async () => {
+      const _dir = tmpLogDir();
+      await execQueueP('retained', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 2, logDir: _dir, logRetention: 2 }));
+      const _files = fs.readdirSync(_dir).filter(f => f.includes('retained-errors')).sort();
+      assert.strictEqual(_files.length, 2);
+      /** The oldest round is the one deleted, the retry number breaks the same-second ties */
+      assert.ok(_files.some(f => f.endsWith('-try1.json')), _files.join('|'));
+      assert.ok(_files.some(f => f.endsWith('-try2.json')), _files.join('|'));
+    });
+
+    it('should not fail the queue when an old file cannot be deleted', async () => {
+      const _dir = tmpLogDir();
+      /** A directory named like an old log file: fs.unlink cannot remove it */
+      fs.mkdirSync(path.join(_dir, '2020-01-01T00-00-00-undeletable-errors.json'));
+      const { errors } = await execQueueP('undeletable', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir, logRetention: 1 }));
+      /** The cleanup failure is a warning, the queue result is intact */
+      assert.strictEqual(errors.length, 1);
+      assert.strictEqual(levelOf('Error Remove Log File:'), 'warn');
+    });
+
+    it('should not fail the queue when the directory cannot be listed', async (t) => {
+      if (process.getuid && process.getuid() === 0) {
+        return t.skip('root bypasses the folder permissions');
+      }
+      const _dir = tmpLogDir();
+      /** Write and execute but no read: the file is created, the cleanup listing fails */
+      fs.chmodSync(_dir, 0o300);
+      try {
+        const { errors } = await execQueueP('unlistable', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir, logRetention: 1 }));
+        assert.strictEqual(errors.length, 1);
+      } finally {
+        fs.chmodSync(_dir, 0o700);
+      }
+      assert.strictEqual(levelOf('Error Read Log Folder:'), 'warn');
+    });
+
+    it('should only delete the files of the same queue and label', async () => {
+      const _dir = tmpLogDir();
+      const _foreign = path.join(_dir, '2020-01-01T00-00-00-other-queue-errors.json');
+      fs.writeFileSync(_foreign, '[]');
+      await execQueueP('isolated', ['a'], (el, next) => next(new Error('boom'), null, { logs: ['keep me'] }), silentOptions({ retry: 1, logDir: _dir, logRetention: 1 }));
+      assert.strictEqual(fs.readdirSync(_dir).filter(f => f.includes('isolated-errors')).length, 1);
+      /** Another queue and another label are never touched */
+      assert.ok(fs.existsSync(_foreign), 'the file of another queue was deleted');
+      assert.ok(fs.readdirSync(_dir).some(f => f.includes('isolated-logs')), 'the logs file was deleted');
+    });
+  });
+
+  describe('status rendering without a TTY', () => {
+    it('should route the status block through the log function', async () => {
+      await execQueueP('status-log', [1, 2], (el, next) => next(null, el), { logEnabled: false, logQueueStatus: true });
+      assert.ok(_capturedLogs.some(l => l.includes('[0] 100% - 2/2')), _capturedLogs.join('|'));
+      assert.strictEqual(levelOf('[0] 100% - 2/2'), 'info');
+    });
+
+    it('should keep printing the status every 10% of progress only', async () => {
+      const _list = Array.from({ length: 100 }, (_, i) => i);
+      await execQueueP('status-throttle', _list, (el, next) => next(null, el), { logEnabled: false, logQueueStatus: true });
+      const _status = _capturedLogs.filter(l => l.startsWith('[0] '));
+      /** One block per 10% step plus the final one, never one per element */
+      assert.ok(_status.length <= 12 && _status.length >= 2, `got ${_status.length} status prints`);
+    });
+
+    it('should print one line per queue in a single block', async () => {
+      await execQueueP('status-block', [1, 2, 3, 4], (el, next) => next(null, el), { concurrency: 2, logEnabled: false, logQueueStatus: true });
+      const _block = _capturedLogs.find(l => l.includes('[0] 100%'));
+      assert.ok(_block, _capturedLogs.join('|'));
+      assert.strictEqual(_block.split('\n').length, 2);
+      assert.ok(_block.includes('[1] '));
+    });
+  });
+
+  describe('security', () => {
+    it('should not let the queue name escape the log directory', async () => {
+      const _root = tmpLogDir();
+      const _dir = path.join(_root, 'app', 'logs');
+      /** A queue name coming from untrusted data must not become a path */
+      await execQueueP('../../../pwned', ['x'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir }));
+      const _written = fs.readdirSync(_dir);
+      assert.strictEqual(_written.length, 1);
+      assert.ok(!_written[0].includes('/') && !_written[0].includes('\\'), _written[0]);
+      /** Nothing written next to, or above, the log directory */
+      assert.deepStrictEqual(fs.readdirSync(path.join(_root, 'app')), ['logs']);
+      assert.deepStrictEqual(fs.readdirSync(_root), ['app']);
+    });
+
+    it('should neutralize path separators and null bytes in the queue name', async () => {
+      const _dir = tmpLogDir();
+      await execQueueP('a/b\\c\u0000d', ['x'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir }));
+      const _written = fs.readdirSync(_dir);
+      assert.strictEqual(_written.length, 1);
+      assert.ok(/^.{19}-a-b-c-d-errors\.json$/.test(_written[0]), _written[0]);
+    });
+
+    it('should not follow a symlink planted in the log directory', async () => {
+      const _dir = tmpLogDir();
+      const _victim = path.join(_dir, '..', 'victim.conf');
+      fs.writeFileSync(_victim, 'IMPORTANT');
+      /** The file name is the timestamp in seconds plus the queue name: a local attacker can
+       * predict it and pre-create a symlink to any file the process can write */
+      for (let i = 0; i < 3; i++) {
+        const _stamp = new Date(Date.now() + i * 1000).toISOString().replace(/:/g, '-').slice(0, 19);
+        try {
+          fs.symlinkSync(_victim, path.join(_dir, `${_stamp}-victim-queue-errors.json`));
+        } catch (err) { /* the name of a previous second already exists */ }
+      }
+      const { errors } = await execQueueP('victim queue', ['x'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir }));
+      assert.strictEqual(fs.readFileSync(_victim, 'utf8'), 'IMPORTANT');
+      /** The write is refused, the queue still reports its errors */
+      assert.strictEqual(errors.length, 1);
+      assert.strictEqual(levelOf('Error Create Log File:'), 'error');
+    });
+
+    it('should serialize a throwing entry as null instead of crashing', async () => {
+      const _dir = tmpLogDir();
+      const _circular = { name: 'evil' };
+      _circular.self = _circular;
+      /** Past the first chunk: the throw used to happen in a setImmediate, uncatchable by the caller */
+      const _logs = Array.from({ length: 600 }, (_, i) => (i === 550 ? _circular : { i: i }));
+      _logs[551] = 10n;
+      await execQueueP('throwing-entry', [1], (el, next) => next(null, el, { logs: _logs }), silentOptions({ logDir: _dir }));
+      const _file = fs.readdirSync(_dir).find(f => f.includes('throwing-entry-logs'));
+      const _content = JSON.parse(fs.readFileSync(path.join(_dir, _file), 'utf8'));
+      assert.strictEqual(_content.length, 600);
+      assert.strictEqual(_content[550], null);
+      assert.strictEqual(_content[551], null);
+      assert.deepStrictEqual(_content[549], { i: 549 });
     });
   });
 

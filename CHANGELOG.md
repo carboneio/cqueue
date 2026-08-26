@@ -5,8 +5,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [1.1.0] - 2026-08-26
 
+### Added
+
+- `logDir` option: directory of the generated error / log files, defaulting to the previous `<cwd>/logs` so nothing changes for existing users. An absolute path makes the files independent of the directory the process was started from
+- `logRetention` option: maximum number of files kept per queue name and label, the oldest being deleted after each successful write. Defaults to `0`, which keeps every file. Only the files matching that queue name and label are deleted
+
+### Security
+
+- Path traversal through the queue name: `execQueue('../../../pwned', ...)` wrote its JSON file outside the log directory, with content coming from the processed elements. Queue names are now reduced to `[a-z0-9._-]` for the file name, and a second guard refuses any path that does not resolve directly inside the log directory
+- Symlink following in the log directory: the file name is the timestamp in seconds plus the queue name, so a local attacker able to write in that directory could pre-create a symlink and have the queue overwrite any file the process can write. Files are now opened with the `wx` flag, which fails instead of following a link or overwriting an existing file. A same-second name collision is now logged at `error` instead of silently overwriting the previous file
+
+### Fixed
+
+- A log or error entry that `JSON.stringify` cannot serialize (a circular structure, a `BigInt`) crashed the process from the chunked writer, and the queue callback was never called. Such an entry is now written as `null`, like the other non-serializable values
+
+- The error / log files were written fire-and-forget: a caller exiting right after the queue, such as `execQueue(..., () => process.exit())`, could truncate or lose the file the error line asks the operator to check. The queue now waits for the write to complete before calling back, and a write failure is logged at `error` without discarding the results
+
 ### Changed
 
+- Without a TTY, the per-queue status block now goes through the function registered with `setLogFunction` (at the `info` level) instead of writing to stdout directly, so the progress reaches the host's logger. The throttling (every 10% of progress plus a final block) and the TTY rendering are unchanged
 - Log levels are now passed to the function registered with `setLogFunction`: failures are logged at `error` (error summary, error file path, `END - Stop retrying`, logs folder / file creation failures) and a retry round about to be attempted at `warn`. Previously every message reached the host logger as `info`
 - The error line lists the distinct error messages with their number of occurrences, most frequent first, capped to the top 3 plus the count of the distinct messages left out: `[queue] 12 errors: "ECONNREFUSED" x9, "ETIMEDOUT" x2, +1 more`. The error JSON file is still written unchanged, and its path is now logged at `error` instead of `info`
 - Emojis removed from the logged messages: the default output prefixes the level instead (`ERROR …`, `WARN …`). The live status block keeps its progress markers

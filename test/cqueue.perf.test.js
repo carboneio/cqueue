@@ -96,18 +96,20 @@ describe('performances', () => {
     const { spawnSync } = require('child_process');
     const _script = `
       const { execQueue, setLogFunction } = require(${JSON.stringify(path.join(__dirname, '..', 'cqueue.js'))});
-      setLogFunction(() => {});
+      let _lines = 0;
+      setLogFunction((msg) => { _lines += String(msg).split('\\n').length; });
       const list = Array.from({ length: 5000 }, (_, i) => i);
-      execQueue('render-bench', list, (el, next) => next(null, el), { concurrency: 2, logEnabled: false, logQueueStatus: true, retry: 0 }, () => {});
+      execQueue('render-bench', list, (el, next) => next(null, el), { concurrency: 2, logEnabled: false, logQueueStatus: true, retry: 0 }, () => process.stdout.write('LINES=' + _lines));
     `;
     const _start = Date.now();
     const _res = spawnSync(process.execPath, ['-e', _script], { encoding: 'utf8', timeout: 30000 });
     const _duration = Date.now() - _start;
     assert.strictEqual(_res.status, 0, _res.stderr);
+    /** Nothing else on stdout: without a TTY the status goes through the configured log function */
+    assert.match(_res.stdout, /^LINES=\d+$/, `unexpected output: ${_res.stdout.slice(0, 200)}`);
     /** Piped stdout = no TTY: the status must be printed on percentage steps, not once per element */
-    const _lines = _res.stdout.split('\n').filter(l => l.length > 0);
-    assert.ok(_lines.length <= 60, `expected at most 60 status lines, got ${_lines.length}`);
-    assert.ok(_res.stdout.length < 50000, `expected less than 50KB of output, got ${_res.stdout.length} bytes`);
+    const _lines = Number(_res.stdout.slice('LINES='.length));
+    assert.ok(_lines <= 60, `expected at most 60 status lines, got ${_lines}`);
     assert.ok(_duration < 5000, `took ${_duration}ms, expected < 5000ms`);
   });
 
