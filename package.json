@@ -1,6 +1,6 @@
 {
   "name": "@carboneio/cqueue",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Zero-dependency concurrent queue executor: parallel queues, retries, rate limiting, progress and performance stats",
   "keywords": [
     "queue",

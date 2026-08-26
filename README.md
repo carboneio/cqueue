@@ -96,12 +96,22 @@ execQueue('sync-users', users, (user, next) => {
 
 ### `setLogFunction(fn)`
 
-Replace the default logger (`console.log`) with your own `(message, level) => {}`. Used by all internal logs (start/end summaries, error counts, file creation).
+Replace the default logger (`console.log`) with your own `(message, level) => {}`. Used by all internal logs (start/end summaries, error summaries, file creation).
+
+**Forward the `level`**: everything that fails is logged at `error`, so a host logger mapping levels to syslog priorities makes queue failures visible to `journalctl -p err`. Dropping the argument reports every failure as `info`.
 
 ```js
 const { setLogFunction } = require('@carboneio/cqueue');
-setLogFunction((msg) => myLogger.info(msg));
+setLogFunction((msg, level = 'info') => myLogger.log(msg, level));
 ```
+
+| Level | Logged messages |
+|---|---|
+| `error` | The error summary, the path of the error file, `END - Stop retrying`, and any failure to create the logs folder / file |
+| `warn` | A retry round about to be attempted (the queue can still recover) |
+| `info` | `START` / `END` summaries and the path of the logs file |
+
+Without a registered function, the default output prefixes the level (`ERROR …`, `WARN …`) and leaves `info` messages unchanged.
 
 ### `msToTime(ms)`
 
@@ -119,6 +129,12 @@ With `logQueueStatus: true`, the per-queue status block is rendered:
 - **Without a TTY** (CI, piped output): a plain status block is printed only when a queue progresses by 10%, plus one final block, so logs are not flooded
 
 ## Error and log files
+
+Each failed round logs the distinct error messages with their number of occurrences, most frequent first, capped to the top 3 followed by the count of the distinct messages left out, so the common failure is readable without opening any file:
+
+```
+[convert-files] 12 errors: "Error: connect ECONNREFUSED" x9, "Error: ETIMEDOUT" x2, +1 more
+```
 
 When elements fail, or when workers provide `actions.logs`, a JSON file is written to `<current working directory>/logs/` (created automatically). Files are serialized and written with a chunked streaming writer, so a huge errors/logs array never blocks the event loop:
 

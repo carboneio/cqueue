@@ -359,7 +359,7 @@ async function execQueue (queueName, list, functionToExecute, options, callback)
  * most frequent first, capped to ERROR_SUMMARY_MAX_ENTRIES entries followed by "+N more"
  *
  * @param {Array} errors Array of { element, message }
- * @returns {String} ex: `"ECONNREFUSED" x9, "invalid template id" x2, +1 more`
+ * @returns {String} ex: `"ECONNREFUSED" x9, "ETIMEDOUT" x2, +1 more`
  */
 function getErrorSummary (errors) {
   const _counts = new Map();

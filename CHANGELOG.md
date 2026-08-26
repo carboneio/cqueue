@@ -3,6 +3,14 @@
 All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-08-26
+
+### Changed
+
+- Log levels are now passed to the function registered with `setLogFunction`: failures are logged at `error` (error summary, error file path, `END - Stop retrying`, logs folder / file creation failures) and a retry round about to be attempted at `warn`. Previously every message reached the host logger as `info`
+- The error line lists the distinct error messages with their number of occurrences, most frequent first, capped to the top 3 plus the count of the distinct messages left out: `[queue] 12 errors: "ECONNREFUSED" x9, "ETIMEDOUT" x2, +1 more`. The error JSON file is still written unchanged, and its path is now logged at `error` instead of `info`
+- Emojis removed from the logged messages: the default output prefixes the level instead (`ERROR …`, `WARN …`). The live status block keeps its progress markers
+
 ## [1.0.0] - 2026-08-12
 
 First release as a dedicated repository.
