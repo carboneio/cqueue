@@ -11,7 +11,17 @@ const { msToTime, execQueue, chunkify, setLogFunction, NS_PER_SEC, MS_PER_NS } =
  * - allows assertions on logged messages
  */
 let _capturedLogs = [];
-setLogFunction((msg) => { _capturedLogs.push(String(msg)); });
+/** Same messages with the level received by the log function, to assert on the levels */
+let _capturedEntries = [];
+setLogFunction((msg, level = 'info') => {
+  _capturedLogs.push(String(msg));
+  _capturedEntries.push({ msg: String(msg), level: level });
+});
+
+/** Level received by the log function for the first captured message containing `part` */
+function levelOf (part) {
+  return _capturedEntries.find(e => e.msg.includes(part))?.level;
+}
 
 /** Base options: silence the live queue status (which writes to stdout) */
 function silentOptions (extra) {
@@ -54,6 +64,7 @@ before(() => {
 
 beforeEach(() => {
   _capturedLogs = [];
+  _capturedEntries = [];
 });
 
 describe('constants', () => {
@@ -428,7 +439,144 @@ describe('execQueue', () => {
     it('should use the function provided to setLogFunction', async () => {
       /** The suite-wide capture function proves setLogFunction works; verify explicitly */
       await execQueueP('custom-log', [1], (el, next) => next(new Error('log me')), silentOptions({ retry: 0 }));
-      assert.ok(_capturedLogs.some(l => l.includes('[custom-log] 🚩 1 errors')));
+      assert.ok(_capturedLogs.some(l => l.includes('[custom-log] 1 errors')));
+    });
+
+    it('should keep the default console output working when no log function is registered', async () => {
+      /** A fresh module instance: its output is the default console.log, never replaced */
+      delete require.cache[require.resolve('../cqueue.js')];
+      const _fresh = require('../cqueue.js');
+      const _written = [];
+      const _consoleLog = console.log;
+      console.log = (msg) => _written.push(String(msg));
+      try {
+        await new Promise(resolve => _fresh.execQueue('default-output', [1], (el, next) => next(new Error('boom')), silentOptions({ retry: 0 }), () => resolve()));
+      } finally {
+        console.log = _consoleLog;
+        delete require.cache[require.resolve('../cqueue.js')];
+      }
+      /** The default output marks the error level and keeps the message otherwise unchanged */
+      assert.ok(_written.some(l => l === 'ERROR [default-output] 1 errors: "Error: boom" x1'), _written.join('\n'));
+      assert.ok(_written.some(l => l.startsWith('ERROR [default-output] Created errors file:')), _written.join('\n'));
+    });
+  });
+
+  describe('log levels', () => {
+    it('should log the error paths at the error level', async () => {
+      await execQueueP('level-run', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0 }));
+      assert.strictEqual(levelOf('] 1 errors'), 'error');
+      /** The error file path must not be stranded at info while the errors are logged at error */
+      assert.strictEqual(levelOf('Created errors file:'), 'error');
+      assert.strictEqual(levelOf('END - Stop retrying, check the error file!'), 'error');
+    });
+
+    it('should log a retry about to be attempted at the warn level', async () => {
+      let _calls = 0;
+      await execQueueP('level-retry', ['a'], (el, next) => next(++_calls === 1 ? new Error('boom') : null, el), silentOptions({ retry: 1 }));
+      assert.strictEqual(levelOf('Retry to re-execute the process on failled elements'), 'warn');
+    });
+
+    it('should log the log file path at the info level', async () => {
+      await execQueueP('level-logs', ['a'], (el, next) => next(null, el, { logs: ['hello'] }), silentOptions());
+      assert.strictEqual(levelOf('Created logs file:'), 'info');
+    });
+
+    it('should log a caught Promise All error at the error level', async () => {
+      /** A non-string queue name makes the error file name generation throw inside the try block */
+      await assert.rejects(execQueueP(123, ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0 })));
+      assert.strictEqual(levelOf('Error: Promise All Catched:'), 'error');
+    });
+
+    it('should log a log folder creation error at the error level', async () => {
+      const _cwd = process.cwd();
+      const _tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cqueue-nofolder-'));
+      /** A file named `logs` makes the mkdir of the logs folder fail */
+      fs.writeFileSync(path.join(_tmp, 'logs'), '');
+      process.chdir(_tmp);
+      try {
+        await execQueueP('level-folder', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0 }));
+      } finally {
+        process.chdir(_cwd);
+      }
+      assert.strictEqual(levelOf('Error Create Log Folder:'), 'error');
+    });
+
+    it('should log a log file creation error at the error level', async (t) => {
+      if (process.getuid && process.getuid() === 0) {
+        return t.skip('root bypasses the folder permissions');
+      }
+      const _cwd = process.cwd();
+      const _tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cqueue-nowrite-'));
+      const _logs = path.join(_tmp, 'logs');
+      /** A read-only logs folder: the mkdir succeeds, the write stream fails */
+      fs.mkdirSync(_logs);
+      fs.chmodSync(_logs, 0o500);
+      process.chdir(_tmp);
+      try {
+        await execQueueP('level-file', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0 }));
+        /** The stream error event is emitted asynchronously */
+        await new Promise(resolve => setTimeout(resolve, 100));
+      } finally {
+        process.chdir(_cwd);
+        fs.chmodSync(_logs, 0o700);
+      }
+      assert.strictEqual(levelOf('Error Create Log File:'), 'error');
+    });
+  });
+
+  describe('error summary', () => {
+    it('should summarize the distinct error messages with their count, most frequent first', async () => {
+      await execQueueP('summary', ['boom', 'nope', 'boom', 'boom'], (el, next) => next(new Error(el)), silentOptions({ retry: 0 }));
+      const _line = _capturedLogs.find(l => l.includes('] 4 errors'));
+      assert.strictEqual(_line, '[summary] 4 errors: "Error: boom" x3, "Error: nope" x1');
+    });
+
+    it('should cap the summary and count the distinct messages left out', async () => {
+      await execQueueP('summary-cap', ['e1', 'e1', 'e2', 'e2', 'e3', 'e4', 'e5'], (el, next) => next(new Error(el)), silentOptions({ retry: 0 }));
+      const _line = _capturedLogs.find(l => l.includes('] 7 errors'));
+      /** Top 3 distinct messages, equal counts keep their first-seen order, then "+N more" */
+      assert.strictEqual(_line, '[summary-cap] 7 errors: "Error: e1" x2, "Error: e2" x2, "Error: e3" x1, +2 more');
+    });
+
+    it('should not cap the summary when the distinct messages fit', async () => {
+      await execQueueP('summary-fit', ['e1', 'e2', 'e3'], (el, next) => next(new Error(el)), silentOptions({ retry: 0 }));
+      const _line = _capturedLogs.find(l => l.includes('] 3 errors'));
+      assert.strictEqual(_line, '[summary-fit] 3 errors: "Error: e1" x1, "Error: e2" x1, "Error: e3" x1');
+      assert.ok(!_line.includes('more'));
+    });
+
+    it('should truncate a long error message in the summary', async () => {
+      const _long = 'x'.repeat(200);
+      await execQueueP('summary-long', [_long], (el, next) => next(new Error(el)), silentOptions({ retry: 0 }));
+      const _line = _capturedLogs.find(l => l.includes('] 1 errors'));
+      /** 100 characters max per message: 99 kept plus the ellipsis */
+      assert.strictEqual(_line, `[summary-long] 1 errors: "${('Error: ' + _long).slice(0, 99)}…" x1`);
+    });
+
+    it('should not truncate a message sitting exactly on the limit', async () => {
+      /** 100 characters with the "Error: " prefix included */
+      const _exact = 'x'.repeat(93);
+      await execQueueP('summary-exact', [_exact], (el, next) => next(new Error(el)), silentOptions({ retry: 0 }));
+      const _line = _capturedLogs.find(l => l.includes('] 1 errors'));
+      assert.strictEqual(_line, `[summary-exact] 1 errors: "Error: ${_exact}" x1`);
+    });
+
+    it('should label an empty error message as unknown', async () => {
+      await execQueueP('summary-empty', ['a'], (el, next) => next({ toString: () => '' }), silentOptions({ retry: 0 }));
+      const _line = _capturedLogs.find(l => l.includes('] 1 errors'));
+      assert.strictEqual(_line, '[summary-empty] 1 errors: "Unknown error" x1');
+    });
+
+    it('should keep writing the full error file next to the summary', async () => {
+      await execQueueP('Summary File', ['boom', 'boom'], (el, next) => next(new Error(el)), silentOptions({ retry: 0 }));
+      const _file = await waitForLogFile('summary-file-errors');
+      assert.ok(_file, 'error file not found');
+      const _content = JSON.parse(fs.readFileSync(_file, 'utf8'));
+      /** Unchanged format: one entry per error, not the deduplicated summary */
+      assert.deepStrictEqual(_content, [
+        { element: 'boom', message: 'Error: boom' },
+        { element: 'boom', message: 'Error: boom' }
+      ]);
     });
   });
 });

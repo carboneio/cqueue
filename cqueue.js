@@ -11,6 +11,10 @@ const RENDER_INTERVAL_MS = 200;
 const RENDER_PERCENT_STEP = 10;
 /** Number of elements serialized per event loop tick when writing a log file */
 const LOG_FILE_CHUNK_SIZE = 500;
+/** Number of distinct error messages detailed in the error summary line */
+const ERROR_SUMMARY_MAX_ENTRIES = 3;
+/** Each message of the error summary is truncated to X characters to keep the line readable */
+const ERROR_SUMMARY_MAX_MESSAGE_LENGTH = 100;
 
 /** Status block currently painted on the TTY, erased/repainted around log messages */
 let activeStatus = null;
@@ -323,15 +327,18 @@ async function execQueue (queueName, list, functionToExecute, options, callback)
       createLogFile(queueName, _logs, 'logs', options.try);
     }
     if (_errors.length > 0) {
-      log(`[${queueName}] 🚩 ${_errors.length} errors`)
-      createLogFile(queueName, _errors, 'errors', options.try);
+      /** The distinct messages are logged inline: the failure is diagnosable from the log
+       * alone, without opening the error file */
+      log(`[${queueName}] ${_errors.length} errors: ${getErrorSummary(_errors)}`, 'error')
+      createLogFile(queueName, _errors, 'errors', options.try, 'error');
       const _toRetry = _errors.map(value => value.element);
       if (options.try < options.retry) {
         options.try += 1;
-        log(`[${queueName}] Retry to re-execute the process on failled elements...`)
+        /** A retry is a warning: the queue can still recover on the next round */
+        log(`[${queueName}] Retry to re-execute the process on failled elements...`, 'warn')
         return execQueue(queueName, _toRetry, functionToExecute, options, callback);
       } else {
-        log(`[${queueName}] END - Stop retrying, check the error file!`)
+        log(`[${queueName}] END - Stop retrying, check the error file!`, 'error')
         /** Errors remaining after the last retry are passed to the callback */
         return callback(null, options.results, _errors);
       }
@@ -341,28 +348,60 @@ async function execQueue (queueName, list, functionToExecute, options, callback)
       }
     }
   } catch (err) {
-    log(`[${queueName}] 🚩 Error: Promise All Catched: ${err.toString()}`);
-    return callback(`[${queueName}] 🚩 Error: Promise All Catched: ${err.toString()}`);
+    log(`[${queueName}] Error: Promise All Catched: ${err.toString()}`, 'error');
+    return callback(`[${queueName}] Error: Promise All Catched: ${err.toString()}`);
   }
   return callback(null, options.results, []);
 }
 
-function createLogFile(queueName, content, label, attempt) {
+/**
+ * Summarize a list of errors as their distinct messages with their number of occurrences,
+ * most frequent first, capped to ERROR_SUMMARY_MAX_ENTRIES entries followed by "+N more"
+ *
+ * @param {Array} errors Array of { element, message }
+ * @returns {String} ex: `"ECONNREFUSED" x9, "invalid template id" x2, +1 more`
+ */
+function getErrorSummary (errors) {
+  const _counts = new Map();
+  for (let i = 0; i < errors.length; i++) {
+    /** Grouped on the full message: two long messages differing at the end stay distinct */
+    const _message = errors[i]?.message ? String(errors[i].message) : 'Unknown error';
+    _counts.set(_message, (_counts.get(_message) ?? 0) + 1);
+  }
+  /** Most frequent first, the insertion order is kept between equal counts (stable sort) */
+  const _sorted = [..._counts.entries()].sort((a, b) => b[1] - a[1]);
+  const _summary = [];
+  for (let i = 0; i < _sorted.length && i < ERROR_SUMMARY_MAX_ENTRIES; i++) {
+    let _message = _sorted[i][0];
+    if (_message.length > ERROR_SUMMARY_MAX_MESSAGE_LENGTH) {
+      _message = _message.slice(0, ERROR_SUMMARY_MAX_MESSAGE_LENGTH - 1) + '…';
+    }
+    _summary.push(`"${_message}" x${_sorted[i][1]}`);
+  }
+  if (_sorted.length > _summary.length) {
+    /** The count of distinct messages left out, not of remaining errors */
+    _summary.push(`+${_sorted.length - _summary.length} more`);
+  }
+  return _summary.join(', ');
+}
+
+function createLogFile(queueName, content, label, attempt, level = 'info') {
   /** Second precision + retry attempt suffix: a retry executed in the same minute does not overwrite the previous file */
   const _suffix = attempt > 0 ? `-try${attempt}` : '';
   const _filename = new Date().toISOString().replace(/:/g, '-').slice(0, 19) + `-${queueName.replace(/\s/g, '-').toLowerCase()}${label ? '-' + label : ''}${_suffix}.json`
   const _dir = path.join(process.cwd(), 'logs');
   const _path = path.join(_dir, _filename);
-  log(`[${queueName}] Created ${label ? label + ' ' : ''}file: ${_path}`);
+  /** The path is logged at the level of its content: an error file must not be stranded at info */
+  log(`[${queueName}] Created ${label ? label + ' ' : ''}file: ${_path}`, level);
 
   try {
     fs.mkdirSync(_dir, { recursive: true });
   } catch (err) {
-    return log(`[${queueName}] 🚩 Error Create Log Folder: ${err.toString()}`);
+    return log(`[${queueName}] Error Create Log Folder: ${err.toString()}`, 'error');
   }
   const _stream = fs.createWriteStream(_path);
   _stream.on('error', (err) => {
-    log(`[${queueName}] 🚩 Error Create Log File: ${err.toString()}`);
+    log(`[${queueName}] Error Create Log File: ${err.toString()}`, 'error');
   });
   let _index = 0;
   /** The content is serialized chunk by chunk with backpressure: one JSON.stringify of a
@@ -420,7 +459,7 @@ function getPerfSummary(lists, resultsLength, errorsLength, logsLength) {
     return (prev.time.passedTime > current.time.passedTime) ? prev : current
   })
   if (_slowest) {
-    return `Duration: ${msToTime(_slowest.time.passedTime)} | Avg time/exec: ${msToTime(_slowest.time.averageTime)} | ${errorsLength > 0 ? '🚩 ' : ''}Errors: ${errorsLength} | Returned: ${resultsLength} | Logs: ${logsLength}`
+    return `Duration: ${msToTime(_slowest.time.passedTime)} | Avg time/exec: ${msToTime(_slowest.time.averageTime)} | Errors: ${errorsLength} | Returned: ${resultsLength} | Logs: ${logsLength}`
   } else {
     return `Error get performances summary`
   }
@@ -428,7 +467,8 @@ function getPerfSummary(lists, resultsLength, errorsLength, logsLength) {
 
 /** Output function, replaceable with setLogFunction */
 let logOutput = function (msg, level = 'info') {
-  return console.log(level === 'error' ? `❗️ ${msg}` : msg );
+  /** The level is prefixed as-is: the severity stays visible on a bare console */
+  return console.log(level === 'info' ? msg : `${level.toUpperCase()} ${msg}`);
 }
 
 /**
