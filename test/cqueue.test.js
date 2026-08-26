@@ -3,7 +3,7 @@ const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { msToTime, execQueue, chunkify, setLogFunction, NS_PER_SEC, MS_PER_NS } = require('../cqueue.js');
+const { msToTime, execQueue, chunkify, setLogFunction, setDefaultOptions, NS_PER_SEC, MS_PER_NS } = require('../cqueue.js');
 
 /**
  * All log output is captured in memory:
@@ -72,6 +72,8 @@ before(() => {
 beforeEach(() => {
   _capturedLogs = [];
   _capturedEntries = [];
+  /** Global options are module state: never leak them from one test to the next */
+  setDefaultOptions(null);
 });
 
 describe('constants', () => {
@@ -652,6 +654,133 @@ describe('execQueue', () => {
       assert.ok(_block, _capturedLogs.join('|'));
       assert.strictEqual(_block.split('\n').length, 2);
       assert.ok(_block.includes('[1] '));
+    });
+  });
+
+  describe('coverage of the remaining paths', () => {
+    it('should apply the delay between asynchronous executions', async () => {
+      const _start = Date.now();
+      /** An asynchronous worker takes the delayed resume path, a synchronous one does not */
+      await execQueueP('async-delay', [1, 2, 3], (el, next) => setTimeout(() => next(null, el), 1), silentOptions({ delay: 25 }));
+      assert.ok(Date.now() - _start >= 50, `took ${Date.now() - _start}ms, expected at least 50ms`);
+    });
+
+    it('should append the error count to the status line', async () => {
+      await execQueueP('status-errors', [1, 2], (el, next) => next(new Error('boom')), { logEnabled: false, logQueueStatus: true, retry: 0, logDir: tmpLogDir() });
+      assert.ok(_capturedLogs.some(l => l.includes('[0] 100% - 2/2') && l.includes('2 errors')), _capturedLogs.join('|'));
+    });
+
+    it('should summarize the performances of the slowest queue', async () => {
+      await execQueueP('perf-summary', [1, 2, 3, 4], (el, next) => next(null, el), { concurrency: 2, logEnabled: true, logQueueStatus: false });
+      /** The summary picks the slowest of the queues, which needs more than one queue */
+      assert.ok(_capturedLogs.some(l => /\[perf-summary\] END - Duration: .* \| Errors: 0 \| Returned: 4 \| Logs: 0/.test(l)), _capturedLogs.join('|'));
+    });
+
+    it('should reject the promise on an internal error when no callback is given', async () => {
+      /** A non-string queue name makes the file name generation throw inside execQueue */
+      await assert.rejects(
+        execQueue(123, ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0 })),
+        (err) => err instanceof Error && err.message.includes('Promise All Catched')
+      );
+    });
+  });
+
+  describe('TTY status rendering', () => {
+    /** `isTTY` and `columns` are plain properties of the stream, so the terminal rendering is
+     * exercised in a child process whose stdout is a pipe, without stubbing the runner's own output */
+    function runInFakeTTY (body) {
+      const { spawnSync } = require('child_process');
+      const _script = `
+        process.stdout.isTTY = true;
+        process.stdout.columns = 80;
+        const { execQueue, setLogFunction } = require(${JSON.stringify(CQUEUE_PATH)});
+        setLogFunction((msg) => process.stderr.write(String(msg) + '\\n'));
+        ${body}
+      `;
+      const _res = spawnSync(process.execPath, ['-e', _script], { encoding: 'utf8', timeout: 30000 });
+      assert.strictEqual(_res.status, 0, _res.stderr);
+      return _res;
+    }
+
+    it('should repaint the status block in place', () => {
+      const _res = runInFakeTTY(`
+        const list = Array.from({ length: 50 }, (_, i) => i);
+        execQueue('tty', list, (el, next) => setTimeout(() => next(null, el), 1), { logEnabled: false, logQueueStatus: true }, () => {});
+      `);
+      /** Cursor hidden, block repainted above itself, end of each line cleared */
+      assert.ok(_res.stdout.includes('\x1b[?25l'), 'the cursor was not hidden');
+      assert.ok(/\x1b\[\d+A/.test(_res.stdout), 'the block was not repainted in place');
+      assert.ok(_res.stdout.includes('\x1b[K'), 'the end of the line was not cleared');
+      assert.ok(_res.stdout.includes('[0] 100%'), 'the final state was not painted');
+      /** 80 columns: the status line is truncated instead of wrapping */
+      assert.ok(_res.stdout.includes('…'), 'the line was not truncated to the terminal width');
+    });
+
+    it('should erase and repaint the block around a log message', () => {
+      const _res = runInFakeTTY(`
+        const list = Array.from({ length: 30 }, (_, i) => i);
+        /** One queue paints its block while another one logs its START line above it */
+        execQueue('tty-bg', list, (el, next) => setTimeout(() => next(null, el), 2), { logEnabled: false, logQueueStatus: true }, () => {});
+        setTimeout(() => execQueue('tty-log', [1], (el, next) => next(null, el), { logEnabled: true, logQueueStatus: false }, () => {}), 10);
+      `);
+      assert.ok(_res.stdout.includes('\x1b[J'), 'the painted block was not erased before the log message');
+      assert.ok(_res.stderr.includes('[tty-log] START'), 'the log message was lost');
+    });
+  });
+
+  describe('setDefaultOptions', () => {
+    it('should apply the global options when the call provides none', async () => {
+      const _dir = tmpLogDir();
+      setDefaultOptions({ concurrency: 3, retry: 0, logEnabled: false, logQueueStatus: false, logDir: _dir });
+      const { results, errors } = await execQueue('global-opts', ['a', 'b'], (el, next) => next(new Error('boom')));
+      /** retry: 0 comes from the global options, the file lands in the global logDir */
+      assert.deepStrictEqual(results, []);
+      assert.strictEqual(errors.length, 2);
+      assert.ok(fs.readdirSync(_dir).some(f => f.includes('global-opts-errors')));
+    });
+
+    it('should let the options of the call win over the global ones', async () => {
+      let _executions = 0;
+      setDefaultOptions({ retry: 5, logEnabled: false, logQueueStatus: false, logDir: tmpLogDir() });
+      await execQueueP('call-wins', ['a'], (el, next) => { _executions += 1; return next(new Error('boom')); }, { retry: 0 });
+      /** One round only: the retry of the call replaces the global one */
+      assert.strictEqual(_executions, 1);
+    });
+
+    it('should replace the previous global options', async () => {
+      setDefaultOptions({ retry: 5, logEnabled: false, logQueueStatus: false });
+      setDefaultOptions({ logEnabled: false, logQueueStatus: false, logDir: tmpLogDir() });
+      let _executions = 0;
+      await execQueueP('replaced', ['a'], (el, next) => { _executions += 1; return next(new Error('boom')); });
+      /** The retry of the first call is gone, back to the default of 1 retry */
+      assert.strictEqual(_executions, 2);
+    });
+
+    it('should reset the global options when called without argument', async () => {
+      setDefaultOptions({ concurrency: 4, logEnabled: false, logQueueStatus: false });
+      setDefaultOptions();
+      await execQueueP('reset-opts', [1, 2], (el, next) => next(null, el), silentOptions());
+      /** logEnabled is back to true: the START line is logged again */
+      assert.ok(_capturedLogs.length === 0);
+      await execQueueP('reset-opts-2', [1], (el, next) => next(null, el), { logQueueStatus: false });
+      assert.ok(_capturedLogs.some(l => l.includes('[reset-opts-2] START - 1 total elements - 1 queue(s)')));
+    });
+
+    it('should copy the given object instead of keeping a reference', async () => {
+      const _options = { retry: 0, logEnabled: false, logQueueStatus: false, logDir: tmpLogDir() };
+      setDefaultOptions(_options);
+      _options.retry = 5;
+      let _executions = 0;
+      await execQueueP('copied-opts', ['a'], (el, next) => { _executions += 1; return next(new Error('boom')); });
+      /** The mutation after the call has no effect */
+      assert.strictEqual(_executions, 1);
+    });
+
+    it('should ignore the internal keys of the global options', async () => {
+      setDefaultOptions({ retry: 0, logEnabled: false, logQueueStatus: false, logDir: tmpLogDir(), _cqueue: true, try: 3, results: ['injected'] });
+      const { results } = await execQueue('internal-keys', [1], (el, next) => next(null, el));
+      /** `_cqueue`, `try` and `results` are internal: never taken from the global options */
+      assert.deepStrictEqual(results, [1]);
     });
   });
 

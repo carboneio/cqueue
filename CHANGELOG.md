@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `setDefaultOptions(options)`: define the options applied to every `execQueue` call instead of repeating them at each call site. The options of the call win, a new call replaces the previous defaults, `null` resets them. The object is copied and the internal keys of the library are never read from it
 - `logDir` option: directory of the generated error / log files, defaulting to the previous `<cwd>/logs` so nothing changes for existing users. An absolute path makes the files independent of the directory the process was started from
 - `logRetentionDays` option: delete the error / log files of the queue older than X days after each successful write, fractions accepted. Defaults to `0`, which keeps every file. The age is read from the timestamp in the file name, so no `stat` call per file, and only the files matching that queue name and label are deleted — never the file of the current run
 

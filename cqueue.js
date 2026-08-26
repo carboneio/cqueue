@@ -18,6 +18,9 @@ const ERROR_SUMMARY_MAX_ENTRIES = 3;
 /** Each message of the error summary is truncated to X characters to keep the line readable */
 const ERROR_SUMMARY_MAX_MESSAGE_LENGTH = 100;
 
+/** Options applied to every execQueue call, replaceable with setDefaultOptions */
+let defaultOptions = {};
+
 /** Status block currently painted on the TTY, erased/repainted around log messages */
 let activeStatus = null;
 
@@ -270,15 +273,17 @@ async function execQueue (queueName, list, functionToExecute, options, callback)
   if (options?._cqueue !== true) {
     /** Options are cloned: the caller's object is never mutated and never leaks state between runs.
      * Retry rounds pass the internal object back and skip this step, avoiding a copy of the results */
+    /** Precedence: the options of the call, then the ones of setDefaultOptions, then these defaults.
+     * Internal keys are never read from the global options */
     options = {
       _cqueue       : true, // Internal - marks an already normalized options object
-      concurrency   : options?.concurrency ?? 1, // Option - number of queues
-      delay         : options?.delay ?? 0, // Option - MS delay between each execution
-      retry         : options?.retry ?? 1, // Option - Number of retries if an error is thrown
-      logEnabled    : options?.logEnabled ?? true, // Option - Log Start and End Performance summary, if false errors are still logged
-      logQueueStatus: options?.logQueueStatus ?? true, // Option - Log on the console each queue status and performances
-      logDir        : path.resolve(options?.logDir ?? path.join(process.cwd(), 'logs')), // Option - directory of the error/log files, resolved once so a later chdir cannot move it
-      logRetentionDays: options?.logRetentionDays ?? 0, // Option - delete the files of the queue older than X days, 0 keeps them all
+      concurrency   : options?.concurrency ?? defaultOptions.concurrency ?? 1, // Option - number of queues
+      delay         : options?.delay ?? defaultOptions.delay ?? 0, // Option - MS delay between each execution
+      retry         : options?.retry ?? defaultOptions.retry ?? 1, // Option - Number of retries if an error is thrown
+      logEnabled    : options?.logEnabled ?? defaultOptions.logEnabled ?? true, // Option - Log Start and End Performance summary, if false errors are still logged
+      logQueueStatus: options?.logQueueStatus ?? defaultOptions.logQueueStatus ?? true, // Option - Log on the console each queue status and performances
+      logDir        : path.resolve(options?.logDir ?? defaultOptions.logDir ?? path.join(process.cwd(), 'logs')), // Option - directory of the error/log files, resolved once so a later chdir cannot move it
+      logRetentionDays: options?.logRetentionDays ?? defaultOptions.logRetentionDays ?? 0, // Option - delete the files of the queue older than X days, 0 keeps them all
       try           : options?.try ?? 0, // Internal - current retry attempt
       results       : options?.results ? [...options.results] : [] // Internal - results accumulator across retries
     };
@@ -605,6 +610,18 @@ function log (msg, level = 'info') {
   return _res;
 }
 
+/**
+ * Define the options applied to every execQueue call
+ * The options passed to execQueue always win, and a new call replaces the previous defaults
+ *
+ * @param {Object} newOptions { concurrency, delay, retry, logEnabled, logQueueStatus, logDir, logRetentionDays }
+ *                            null or nothing resets them
+ */
+function setDefaultOptions (newOptions) {
+  /** Copied: a later mutation of the caller's object never changes the behaviour of a running queue */
+  defaultOptions = newOptions ? { ...newOptions } : {};
+}
+
 function setLogFunction (newLogFunction) {
   if (newLogFunction) {
     logOutput = newLogFunction;
@@ -616,6 +633,7 @@ module.exports = {
   execQueue,
   chunkify,
   setLogFunction,
+  setDefaultOptions,
   NS_PER_SEC,
   MS_PER_NS
 }

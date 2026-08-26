@@ -52,7 +52,7 @@ const { results, errors } = await execQueue('convert-files', files, worker, { co
 | `queueName` | `String` | Name used in logs and generated file names. Reduced to `[a-z0-9._-]` in file names, so a name built from untrusted data cannot escape `logDir` |
 | `list` | `Array` | Elements to process (objects, strings, numbers…) |
 | `functionToExecute` | `Function` | Worker `(element, next) => {}` executed for each element |
-| `options` | `Object` | Optional, see below |
+| `options` | `Object` | Optional, see below. Merged over the ones of [`setDefaultOptions`](#setdefaultoptionsoptions) |
 | `callback` | `Function` | Optional `(err, results, errors) => {}`. When omitted, a promise resolving `{ results, errors }` is returned |
 
 #### Options
@@ -95,6 +95,21 @@ execQueue('sync-users', users, (user, next) => {
   });
 }, { concurrency: 5, delay: 100, retry: 2 }, (err, results, errors) => { /* ... */ });
 ```
+
+### `setDefaultOptions(options)`
+
+Define the options applied to every `execQueue` call, so a deployment-wide setting is not repeated at each call site. The options passed to `execQueue` always win, and each call **replaces** the previous defaults (call it with `null` or nothing to reset them).
+
+```js
+const { setDefaultOptions, execQueue } = require('@carboneio/cqueue');
+
+setDefaultOptions({ concurrency: 10, logDir: '/var/log/myapp', logRetentionDays: 30 });
+
+await execQueue('convert-files', files, worker);              // 10 queues, /var/log/myapp
+await execQueue('sync-users', users, worker, { concurrency: 2 }); // 2 queues, same logDir
+```
+
+Accepts the same options as `execQueue`. The object is copied, so mutating it afterwards changes nothing, and the internal keys of the library are never read from it.
 
 ### `setLogFunction(fn)`
 
@@ -159,7 +174,7 @@ execQueue('convert-files', files, worker, { logDir: '/var/log/myapp', logRetenti
 ## Exports
 
 ```js
-const { execQueue, msToTime, chunkify, setLogFunction, NS_PER_SEC, MS_PER_NS } = require('@carboneio/cqueue');
+const { execQueue, msToTime, chunkify, setLogFunction, setDefaultOptions, NS_PER_SEC, MS_PER_NS } = require('@carboneio/cqueue');
 ```
 
 ## Tests
