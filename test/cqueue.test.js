@@ -550,29 +550,65 @@ describe('execQueue', () => {
     });
   });
 
-  describe('logRetention option', () => {
+  describe('logRetentionDays option', () => {
+    /** Write a file named like a log file of `queueName`, `days` days ago */
+    function writeAgedFile (dir, queueName, label, days) {
+      const _stamp = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().replace(/:/g, '-').slice(0, 19);
+      const _name = `${_stamp}-${queueName}${label ? '-' + label : ''}.json`;
+      fs.writeFileSync(path.join(dir, _name), '[]');
+      return _name;
+    }
+
     it('should keep every file by default', async () => {
       const _dir = tmpLogDir();
-      await execQueueP('kept-all', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 2, logDir: _dir }));
-      /** 1 initial round + 2 retries */
-      assert.strictEqual(fs.readdirSync(_dir).filter(f => f.includes('kept-all-errors')).length, 3);
+      const _old = writeAgedFile(_dir, 'kept-all', 'errors', 400);
+      await execQueueP('kept-all', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir }));
+      assert.ok(fs.existsSync(path.join(_dir, _old)), 'a 400 days old file was deleted without the option');
     });
 
-    it('should keep only the last files of the queue', async () => {
+    it('should delete the files older than the given number of days', async () => {
       const _dir = tmpLogDir();
-      await execQueueP('retained', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 2, logDir: _dir, logRetention: 2 }));
-      const _files = fs.readdirSync(_dir).filter(f => f.includes('retained-errors')).sort();
-      assert.strictEqual(_files.length, 2);
-      /** The oldest round is the one deleted, the retry number breaks the same-second ties */
-      assert.ok(_files.some(f => f.endsWith('-try1.json')), _files.join('|'));
-      assert.ok(_files.some(f => f.endsWith('-try2.json')), _files.join('|'));
+      const _old = writeAgedFile(_dir, 'aged', 'errors', 30);
+      const _recent = writeAgedFile(_dir, 'aged', 'errors', 3);
+      await execQueueP('aged', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir, logRetentionDays: 7 }));
+      assert.ok(!fs.existsSync(path.join(_dir, _old)), 'the 30 days old file was kept');
+      /** Younger than the retention: kept, like the file of the current run */
+      assert.ok(fs.existsSync(path.join(_dir, _recent)), 'the 3 days old file was deleted');
+      assert.strictEqual(fs.readdirSync(_dir).filter(f => f.includes('aged-errors')).length, 2);
+    });
+
+    it('should accept a fraction of a day', async () => {
+      const _dir = tmpLogDir();
+      const _old = writeAgedFile(_dir, 'fraction', 'errors', 1 / 24);
+      await execQueueP('fraction', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir, logRetentionDays: 1 / 48 }));
+      assert.ok(!fs.existsSync(path.join(_dir, _old)), 'the one hour old file was kept');
+    });
+
+    it('should never delete the file of the current run', async () => {
+      const _dir = tmpLogDir();
+      /** A retention shorter than the second precision of the file name must not delete it */
+      await execQueueP('current', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir, logRetentionDays: 1 / 86400000 }));
+      assert.strictEqual(fs.readdirSync(_dir).filter(f => f.includes('current-errors')).length, 1);
+    });
+
+    it('should only delete the files of the same queue and label', async () => {
+      const _dir = tmpLogDir();
+      const _foreign = writeAgedFile(_dir, 'other-queue', 'errors', 30);
+      const _otherLabel = writeAgedFile(_dir, 'isolated', 'logs', 30);
+      const _unknown = path.join(_dir, 'not-a-log-file.json');
+      fs.writeFileSync(_unknown, '[]');
+      await execQueueP('isolated', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir, logRetentionDays: 7 }));
+      assert.ok(fs.existsSync(path.join(_dir, _foreign)), 'the file of another queue was deleted');
+      assert.ok(fs.existsSync(path.join(_dir, _otherLabel)), 'the logs file was deleted by the errors cleanup');
+      assert.ok(fs.existsSync(_unknown), 'an unrelated file was deleted');
     });
 
     it('should not fail the queue when an old file cannot be deleted', async () => {
       const _dir = tmpLogDir();
       /** A directory named like an old log file: fs.unlink cannot remove it */
-      fs.mkdirSync(path.join(_dir, '2020-01-01T00-00-00-undeletable-errors.json'));
-      const { errors } = await execQueueP('undeletable', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir, logRetention: 1 }));
+      const _stamp = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().replace(/:/g, '-').slice(0, 19);
+      fs.mkdirSync(path.join(_dir, `${_stamp}-undeletable-errors.json`));
+      const { errors } = await execQueueP('undeletable', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir, logRetentionDays: 7 }));
       /** The cleanup failure is a warning, the queue result is intact */
       assert.strictEqual(errors.length, 1);
       assert.strictEqual(levelOf('Error Remove Log File:'), 'warn');
@@ -586,23 +622,12 @@ describe('execQueue', () => {
       /** Write and execute but no read: the file is created, the cleanup listing fails */
       fs.chmodSync(_dir, 0o300);
       try {
-        const { errors } = await execQueueP('unlistable', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir, logRetention: 1 }));
+        const { errors } = await execQueueP('unlistable', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir, logRetentionDays: 7 }));
         assert.strictEqual(errors.length, 1);
       } finally {
         fs.chmodSync(_dir, 0o700);
       }
       assert.strictEqual(levelOf('Error Read Log Folder:'), 'warn');
-    });
-
-    it('should only delete the files of the same queue and label', async () => {
-      const _dir = tmpLogDir();
-      const _foreign = path.join(_dir, '2020-01-01T00-00-00-other-queue-errors.json');
-      fs.writeFileSync(_foreign, '[]');
-      await execQueueP('isolated', ['a'], (el, next) => next(new Error('boom'), null, { logs: ['keep me'] }), silentOptions({ retry: 1, logDir: _dir, logRetention: 1 }));
-      assert.strictEqual(fs.readdirSync(_dir).filter(f => f.includes('isolated-errors')).length, 1);
-      /** Another queue and another label are never touched */
-      assert.ok(fs.existsSync(_foreign), 'the file of another queue was deleted');
-      assert.ok(fs.readdirSync(_dir).some(f => f.includes('isolated-logs')), 'the logs file was deleted');
     });
   });
 

@@ -11,6 +11,8 @@ const RENDER_INTERVAL_MS = 200;
 const RENDER_PERCENT_STEP = 10;
 /** Number of elements serialized per event loop tick when writing a log file */
 const LOG_FILE_CHUNK_SIZE = 500;
+/** Retention is expressed in days */
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
 /** Number of distinct error messages detailed in the error summary line */
 const ERROR_SUMMARY_MAX_ENTRIES = 3;
 /** Each message of the error summary is truncated to X characters to keep the line readable */
@@ -276,7 +278,7 @@ async function execQueue (queueName, list, functionToExecute, options, callback)
       logEnabled    : options?.logEnabled ?? true, // Option - Log Start and End Performance summary, if false errors are still logged
       logQueueStatus: options?.logQueueStatus ?? true, // Option - Log on the console each queue status and performances
       logDir        : path.resolve(options?.logDir ?? path.join(process.cwd(), 'logs')), // Option - directory of the error/log files, resolved once so a later chdir cannot move it
-      logRetention  : options?.logRetention ?? 0, // Option - max number of files kept per queue name and label, 0 keeps them all
+      logRetentionDays: options?.logRetentionDays ?? 0, // Option - delete the files of the queue older than X days, 0 keeps them all
       try           : options?.try ?? 0, // Internal - current retry attempt
       results       : options?.results ? [...options.results] : [] // Internal - results accumulator across retries
     };
@@ -406,7 +408,7 @@ function escapeRegExp (str) {
  * @param {String} queueName Name of the queue
  * @param {Array} content Elements to serialize
  * @param {String} label `errors` or `logs`, part of the file name
- * @param {Object} options Normalized options (try, logDir, logRetention)
+ * @param {Object} options Normalized options (try, logDir, logRetentionDays)
  * @param {String} level [OPTIONAL] Level used to log the path of the created file
  * @returns {Promise} Resolved once the file is fully written and the retention applied.
  *                    Never rejected: a write failure is logged and the queue results are kept
@@ -447,7 +449,7 @@ function createLogFile (queueName, content, label, options, level = 'info') {
     _stream.on('finish', () => {
       if (_settled === false) {
         _settled = true;
-        return removeOldLogFiles(queueName, label, options, resolve);
+        return removeOldLogFiles(queueName, label, options, _filename, resolve);
       }
     });
     let _index = 0;
@@ -480,18 +482,20 @@ function createLogFile (queueName, content, label, options, level = 'info') {
 }
 
 /**
- * Delete the oldest files of the same queue and label, keeping `options.logRetention` of them
+ * Delete the files of the same queue and label older than `options.logRetentionDays`
  * A cleanup failure is not a queue failure: it is logged as a warning and never blocks the callback
  *
  * @param {String} queueName Name of the queue
  * @param {String} label `errors` or `logs`
- * @param {Object} options Normalized options (logDir, logRetention)
+ * @param {Object} options Normalized options (logDir, logRetentionDays)
+ * @param {String} currentFile Name of the file just written, never deleted
  * @param {Function} callback Called once the cleanup is done
  */
-function removeOldLogFiles (queueName, label, options, callback) {
-  if (!(options.logRetention > 0)) {
+function removeOldLogFiles (queueName, label, options, currentFile, callback) {
+  if (!(options.logRetentionDays > 0)) {
     return callback();
   }
+  const _limit = Date.now() - (options.logRetentionDays * MS_PER_DAY);
   fs.readdir(options.logDir, (err, files) => {
     if (err) {
       log(`[${queueName}] Error Read Log Folder: ${err.toString()}`, 'warn');
@@ -499,24 +503,22 @@ function removeOldLogFiles (queueName, label, options, callback) {
     }
     /** Only the files of this queue and label: another queue, or another program writing
      * in the same folder, is never touched */
-    const _pattern = new RegExp(`^(.{19})-${escapeRegExp(getQueueSlug(queueName))}${label ? '-' + label : ''}(?:-try(\\d+))?\\.json$`);
-    const _files = [];
+    const _pattern = new RegExp(`^(.{19})-${escapeRegExp(getQueueSlug(queueName))}${label ? '-' + label : ''}(?:-try\\d+)?\\.json$`);
+    const _toRemove = [];
     for (let i = 0; i < files.length; i++) {
       const _match = _pattern.exec(files[i]);
-      if (_match !== null) {
-        _files.push({ name: files[i], date: _match[1], try: _match[2] !== undefined ? Number(_match[2]) : 0 });
+      /** The date comes from the file name: no fs.stat on every file of the folder.
+       * An unreadable date gives NaN, which compares false and keeps the file */
+      if (_match !== null && files[i] !== currentFile && parseLogFileDate(_match[1]) < _limit) {
+        _toRemove.push(files[i]);
       }
     }
-    if (_files.length <= options.logRetention) {
+    if (_toRemove.length === 0) {
       return callback();
     }
-    /** Oldest first: the ISO timestamp prefix sorts lexicographically and the retry number breaks
-     * the ties of rounds written within the same second */
-    _files.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : a.try - b.try);
-    const _toRemove = _files.slice(0, _files.length - options.logRetention);
     let _pending = _toRemove.length;
     for (let i = 0; i < _toRemove.length; i++) {
-      fs.unlink(path.join(options.logDir, _toRemove[i].name), (err) => {
+      fs.unlink(path.join(options.logDir, _toRemove[i]), (err) => {
         if (err) {
           log(`[${queueName}] Error Remove Log File: ${err.toString()}`, 'warn');
         }
@@ -527,6 +529,16 @@ function removeOldLogFiles (queueName, label, options, callback) {
       });
     }
   });
+}
+
+/**
+ * Convert the `2026-08-12T14-05-33` prefix of a file name back to a timestamp
+ *
+ * @param {String} stamp Date part of the file name
+ * @returns {Number} Milliseconds, NaN when the prefix is not a date written by createLogFile
+ */
+function parseLogFileDate (stamp) {
+  return Date.parse(stamp.slice(0, 11) + stamp.slice(11).replace(/-/g, ':') + 'Z');
 }
 
 function chunkify(list, size, logQueueStatus) {

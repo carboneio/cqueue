@@ -64,7 +64,7 @@ const { results, errors } = await execQueue('convert-files', files, worker, { co
 | `retry` | `Number` | `1` | Number of extra rounds re-executing only the failed elements. `0` disables retries |
 | `logEnabled` | `Boolean` | `true` | Log the START line and the END performance summary. Errors are still logged when `false` |
 | `logDir` | `String` | `<cwd>/logs` | Directory of the generated error / log JSON files, created if missing. Set it to an absolute path so the files do not depend on the directory the process was started from |
-| `logRetention` | `Number` | `0` | Maximum number of files kept per queue name and label (`errors`, `logs`); the oldest ones are deleted after each successful write. `0` keeps every file. Only the files of that queue and label are ever deleted |
+| `logRetentionDays` | `Number` | `0` | Delete the error / log files of that queue older than X days, after each successful write. Fractions are accepted (`0.5` = 12 hours). `0` keeps every file. The age comes from the timestamp in the file name, and only the files of that queue name and label are ever deleted — never the file of the current run, another queue's files, or anything else in the directory |
 | `logQueueStatus` | `Boolean` | `true` | Live per-queue progress (`[0] 45% - 45/100 - Passed time: 2.1 Sec \| Left Time: 2.5 Sec \| Avg time/exec: 47 ms`). See [Live status rendering](#live-status-rendering) |
 
 #### Callback / promise result
@@ -150,10 +150,10 @@ Files are created with the `wx` flag: the queue never follows a symlink nor over
 
 The queue waits for these files to be fully written before calling back, so a caller exiting immediately — `execQueue(..., () => process.exit())` — always gets a complete file. A file that cannot be written is logged at the `error` level and never discards the results or the errors returned to the caller.
 
-Use `logRetention` to bound the directory:
+Use `logRetentionDays` to bound the directory:
 
 ```js
-execQueue('convert-files', files, worker, { logDir: '/var/log/myapp', logRetention: 10 });
+execQueue('convert-files', files, worker, { logDir: '/var/log/myapp', logRetentionDays: 30 });
 ```
 
 ## Exports
