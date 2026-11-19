@@ -13,14 +13,19 @@ const { msToTime, execQueue, chunkify, setLogFunction, setDefaultOptions, NS_PER
 let _capturedLogs = [];
 /** Same messages with the level received by the log function, to assert on the levels */
 let _capturedEntries = [];
-setLogFunction((msg, level = 'info') => {
+setLogFunction((msg, level = 'info', fields) => {
   _capturedLogs.push(String(msg));
-  _capturedEntries.push({ msg: String(msg), level: level });
+  _capturedEntries.push({ msg: String(msg), level: level, fields: fields });
 });
 
 /** Level received by the log function for the first captured message containing `part` */
 function levelOf (part) {
   return _capturedEntries.find(e => e.msg.includes(part))?.level;
+}
+
+/** Captured entries of a structured event, in logging order */
+function entriesOf (event) {
+  return _capturedEntries.filter(e => e.fields?.event === event);
 }
 
 /** Base options: silence the live queue status (which writes to stdout) */
@@ -45,6 +50,18 @@ async function waitForLogFile (namePart, timeoutMs = 2000) {
 }
 
 const CQUEUE_PATH = path.join(__dirname, '..', 'cqueue.js');
+
+/** Make execQueue fail internally: Promise.allSettled is its first call inside its try block,
+ * made synchronously, so the original is restored before anything else can use it */
+function withInternalError (fn, message = 'internal failure') {
+  const _allSettled = Promise.allSettled;
+  Promise.allSettled = () => Promise.reject(new TypeError(message));
+  try {
+    return fn();
+  } finally {
+    Promise.allSettled = _allSettled;
+  }
+}
 
 /** A dedicated empty folder, used as the `logDir` option */
 function tmpLogDir () {
@@ -677,9 +694,8 @@ describe('execQueue', () => {
     });
 
     it('should reject the promise on an internal error when no callback is given', async () => {
-      /** A non-string queue name makes the file name generation throw inside execQueue */
       await assert.rejects(
-        execQueue(123, ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0 })),
+        withInternalError(() => execQueue('internal', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0 }))),
         (err) => err instanceof Error && err.message.includes('Promise All Catched')
       );
     });
@@ -820,9 +836,41 @@ describe('execQueue', () => {
       }
       const { errors } = await execQueueP('victim queue', ['x'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir }));
       assert.strictEqual(fs.readFileSync(_victim, 'utf8'), 'IMPORTANT');
-      /** The write is refused, the queue still reports its errors */
       assert.strictEqual(errors.length, 1);
-      assert.strictEqual(levelOf('Error Create Log File:'), 'error');
+      /** The planted name is refused, the file is written under a unique name next to it */
+      const _written = fs.readdirSync(_dir).filter(f => !fs.lstatSync(path.join(_dir, f)).isSymbolicLink());
+      assert.strictEqual(_written.length, 1);
+      assert.match(_written[0], new RegExp(`^.{19}-victim-queue-errors-${process.pid}-\\d+\\.json$`));
+      assert.strictEqual(JSON.parse(fs.readFileSync(path.join(_dir, _written[0]), 'utf8')).length, 1);
+    });
+
+    it('should refuse the write when the unique name is planted as well', async () => {
+      const _dir = tmpLogDir();
+      const _victim = path.join(_dir, '..', 'victim2.conf');
+      fs.writeFileSync(_victim, 'IMPORTANT');
+      /** A fresh module: its first collision uses the suffix `-<pid>-1` */
+      delete require.cache[require.resolve('../cqueue.js')];
+      const _fresh = require('../cqueue.js');
+      delete require.cache[require.resolve('../cqueue.js')];
+      const _entries = [];
+      _fresh.setLogFunction((msg, level, fields) => _entries.push({ msg, level, fields }));
+      for (let i = 0; i < 3; i++) {
+        const _stamp = new Date(Date.now() + i * 1000).toISOString().replace(/:/g, '-').slice(0, 19);
+        for (const _name of [`${_stamp}-victim2-errors.json`, `${_stamp}-victim2-errors-${process.pid}-1.json`]) {
+          try {
+            fs.symlinkSync(_victim, path.join(_dir, _name));
+          } catch (err) { /* already planted */ }
+        }
+      }
+      const { errors } = await _fresh.execQueue('victim2', ['x'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir }));
+      assert.strictEqual(fs.readFileSync(_victim, 'utf8'), 'IMPORTANT');
+      assert.strictEqual(errors.length, 1);
+      const _error = _entries.find(e => e.fields.event === 'log_file_error');
+      assert.strictEqual(_error.level, 'error');
+      assert.match(_error.fields.error, /EEXIST/);
+      /** Nothing announced as created, and the END line does not point to a missing file */
+      assert.strictEqual(_entries.filter(e => e.fields.event === 'log_file').length, 0);
+      assert.strictEqual(_entries.find(e => e.fields.event === 'queue_failed').msg, '[victim2] END - Stop retrying');
     });
 
     it('should serialize a throwing entry as null instead of crashing', async () => {
@@ -863,8 +911,7 @@ describe('execQueue', () => {
     });
 
     it('should log a caught Promise All error at the error level', async () => {
-      /** A non-string queue name makes the error file name generation throw inside the try block */
-      await assert.rejects(execQueueP(123, ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0 })));
+      await assert.rejects(withInternalError(() => execQueueP('level-crash', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0 }))));
       assert.strictEqual(levelOf('Error: Promise All Catched:'), 'error');
     });
 
@@ -958,6 +1005,596 @@ describe('execQueue', () => {
         { element: 'boom', message: 'Error: boom' },
         { element: 'boom', message: 'Error: boom' }
       ]);
+    });
+  });
+
+  describe('structured log fields', () => {
+    it('should pass queue_start and queue_end fields with the round duration', async () => {
+      await execQueueP('fields-run', [1, 2, 3, 4], (el, next) => setTimeout(() => next(null, el), 5), { concurrency: 2, delay: 0, retry: 3, logQueueStatus: false });
+      const [_start] = entriesOf('queue_start');
+      assert.strictEqual(_start.level, 'info');
+      assert.ok(_start.msg.startsWith('[fields-run] START - 4 total elements'));
+      assert.deepStrictEqual(_start.fields, { event: 'queue_start', queue: 'fields-run', total: 4, concurrency: 2, delay: 0, retry: 3, try: 0 });
+      const [_end] = entriesOf('queue_end');
+      assert.strictEqual(_end.level, 'info');
+      assert.ok(_end.msg.startsWith('[fields-run] END - Duration:'), _end.msg);
+      const { duration_ms, avg_ms, ..._rest } = _end.fields;
+      assert.deepStrictEqual(_rest, { event: 'queue_end', queue: 'fields-run', total: 4, results: 4, errors: 0, try: 0 });
+      /** 2 elements of ~5ms per queue: the wall clock of the round, not a sum of the queues */
+      assert.ok(Number.isInteger(duration_ms) && duration_ms >= 8 && duration_ms < 1000, `duration_ms ${duration_ms}`);
+      assert.ok(Number.isInteger(avg_ms) && avg_ms >= 4 && avg_ms <= duration_ms, `avg_ms ${avg_ms}`);
+    });
+
+    it('should pass queue_errors, queue_retry and queue_failed fields', async () => {
+      const _dir = tmpLogDir();
+      await execQueueP('fields-fail', ['ok', 'bad1', 'bad2'], (el, next) => next(el === 'ok' ? null : new Error('boom'), el), silentOptions({ retry: 1, logDir: _dir }));
+      const _errors = entriesOf('queue_errors');
+      assert.strictEqual(_errors.length, 2);
+      assert.deepStrictEqual(_errors.map(e => e.level), ['error', 'error']);
+      assert.deepStrictEqual(_errors[0].fields, { event: 'queue_errors', queue: 'fields-fail', errors: 2, try: 0, summary: '"Error: boom" x2' });
+      assert.strictEqual(_errors[1].fields.try, 1);
+      const _retry = entriesOf('queue_retry');
+      assert.strictEqual(_retry.length, 1);
+      assert.strictEqual(_retry[0].level, 'warn');
+      /** `try` is the number of the round about to start */
+      assert.deepStrictEqual(_retry[0].fields, { event: 'queue_retry', queue: 'fields-fail', try: 1, elements: 2, delay_ms: 0 });
+      const [_failed] = entriesOf('queue_failed');
+      assert.strictEqual(_failed.level, 'error');
+      assert.strictEqual(_failed.msg, '[fields-fail] END - Stop retrying, check the error file!');
+      const { duration_ms, ..._rest } = _failed.fields;
+      assert.deepStrictEqual(_rest, { event: 'queue_failed', queue: 'fields-fail', errors: 2, try: 1, total: 2 });
+      assert.ok(Number.isInteger(duration_ms) && duration_ms >= 0);
+      /** No success line for a failed queue */
+      assert.strictEqual(entriesOf('queue_end').length, 0);
+    });
+
+    it('should count the results of every round in the queue_end of a recovered queue', async () => {
+      let _calls = 0;
+      await execQueueP('fields-recover', ['a', 'b', 'c'], (el, next) => (el === 'b' && ++_calls === 1 ? next(new Error('once')) : next(null, el)), { logQueueStatus: false, errorFile: false });
+      const _end = entriesOf('queue_end');
+      assert.strictEqual(_end.length, 1);
+      /** The retry round executed one element, the caller receives the 3 results */
+      assert.strictEqual(_end[0].fields.try, 1);
+      assert.strictEqual(_end[0].fields.total, 1);
+      assert.strictEqual(_end[0].fields.results, 3);
+    });
+
+    it('should pass log_file fields with the level of the file', async () => {
+      const _dir = tmpLogDir();
+      await execQueueP('fields-file', ['a'], (el, next) => next(new Error('boom'), el, { logs: ['hello'] }), silentOptions({ retry: 0, logDir: _dir }));
+      const _files = entriesOf('log_file');
+      assert.deepStrictEqual(_files.map(e => [e.fields.label, e.level]), [['logs', 'info'], ['errors', 'error']]);
+      for (const _entry of _files) {
+        assert.deepStrictEqual(Object.keys(_entry.fields), ['event', 'queue', 'label', 'path']);
+        assert.strictEqual(_entry.fields.queue, 'fields-file');
+        assert.strictEqual(path.dirname(_entry.fields.path), _dir);
+        assert.ok(fs.existsSync(_entry.fields.path));
+      }
+    });
+
+    it('should pass log_file_error fields with the message of the failure', async (t) => {
+      if (process.getuid && process.getuid() === 0) {
+        return t.skip('root bypasses the folder permissions');
+      }
+      const _dir = tmpLogDir();
+      fs.chmodSync(_dir, 0o500);
+      try {
+        await execQueueP('fields-nowrite', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir }));
+      } finally {
+        fs.chmodSync(_dir, 0o700);
+      }
+      const [_error] = entriesOf('log_file_error');
+      assert.strictEqual(_error.level, 'error');
+      assert.strictEqual(_error.fields.queue, 'fields-nowrite');
+      assert.strictEqual(_error.fields.label, 'errors');
+      assert.strictEqual(path.dirname(_error.fields.path), _dir);
+      assert.match(_error.fields.error, /EACCES/);
+    });
+
+    it('should pass log_cleanup_error fields at the warn level', async () => {
+      const _dir = tmpLogDir();
+      const _stamp = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().replace(/:/g, '-').slice(0, 19);
+      fs.mkdirSync(path.join(_dir, `${_stamp}-fields-cleanup-errors.json`));
+      await execQueueP('fields-cleanup', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir, logRetentionDays: 7 }));
+      const [_warn] = entriesOf('log_cleanup_error');
+      assert.strictEqual(_warn.level, 'warn');
+      assert.strictEqual(_warn.fields.queue, 'fields-cleanup');
+      assert.strictEqual(_warn.fields.path, path.join(_dir, `${_stamp}-fields-cleanup-errors.json`));
+      assert.strictEqual(typeof _warn.fields.error, 'string');
+    });
+
+    it('should pass queue_crash fields on an internal error', async () => {
+      await assert.rejects(withInternalError(() => execQueueP(123, ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0 }))));
+      const [_crash] = entriesOf('queue_crash');
+      assert.strictEqual(_crash.level, 'error');
+      /** The queue name is always passed as a string */
+      assert.strictEqual(_crash.fields.queue, '123');
+      assert.strictEqual(_crash.fields.try, 0);
+      assert.strictEqual(_crash.fields.error, 'TypeError: internal failure');
+    });
+
+    it('should pass aggregated queue_progress fields without a TTY', async () => {
+      await execQueueP('fields-progress', [1, 2, 3, 4, 5], (el, next) => next(null, el), { concurrency: 2, logEnabled: false, logQueueStatus: true });
+      const _progress = entriesOf('queue_progress');
+      assert.ok(_progress.length >= 2, `got ${_progress.length} progress entries`);
+      /** The message is the unchanged multi-line status block */
+      assert.ok(_progress.at(-1).msg.startsWith('[0] 100% - 3/3'));
+      assert.deepStrictEqual(_progress.at(-1).fields, { event: 'queue_progress', queue: 'fields-progress', try: 0, queues: 2, done: 5, total: 5, percent: 100, eta_ms: 0, errors: 0 });
+      assert.ok(_progress[0].fields.done < 5);
+    });
+
+    it('should always pass a flat object of primitives with event and queue', async () => {
+      const _dir = tmpLogDir();
+      await execQueueP('fields-flat', ['ok', 'bad'], (el, next) => next(el === 'bad' ? new Error('boom') : null, { nested: el }, { logs: [{ el }] }),
+        { logQueueStatus: true, retry: 1, logDir: _dir, logRetentionDays: 7 });
+      assert.ok(_capturedEntries.length >= 8, `got ${_capturedEntries.length} entries`);
+      for (const _entry of _capturedEntries) {
+        assert.ok(_entry.fields && Object.getPrototypeOf(_entry.fields) === Object.prototype, _entry.msg);
+        assert.strictEqual(typeof _entry.fields.event, 'string', _entry.msg);
+        assert.strictEqual(_entry.fields.queue, 'fields-flat', _entry.msg);
+        for (const [_key, _value] of Object.entries(_entry.fields)) {
+          assert.ok(['string', 'number', 'boolean'].includes(typeof _value), `${_entry.fields.event}.${_key} is ${typeof _value}`);
+        }
+      }
+    });
+
+    it('should keep a 2 arguments logger and the default console output working', async () => {
+      delete require.cache[require.resolve('../cqueue.js')];
+      const _fresh = require('../cqueue.js');
+      delete require.cache[require.resolve('../cqueue.js')];
+      const _legacy = [];
+      _fresh.setLogFunction(function (msg, level) { _legacy.push(`${level}|${msg}`); });
+      await _fresh.execQueue('legacy', ['bad'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: tmpLogDir() }));
+      assert.ok(_legacy.includes('error|[legacy] 1 errors: "Error: boom" x1'), _legacy.join('\n'));
+      assert.ok(_legacy.includes('error|[legacy] END - Stop retrying, check the error file!'), _legacy.join('\n'));
+
+      /** The default output receives the message only: the fields are never printed as an object */
+      delete require.cache[require.resolve('../cqueue.js')];
+      const _default = require('../cqueue.js');
+      delete require.cache[require.resolve('../cqueue.js')];
+      const _calls = [];
+      const _consoleLog = console.log;
+      console.log = (...args) => _calls.push(args);
+      try {
+        await _default.execQueue('default-fields', [1], (el, next) => next(null, el), { logQueueStatus: false });
+      } finally {
+        console.log = _consoleLog;
+      }
+      assert.ok(_calls.length >= 2);
+      assert.ok(_calls.every(args => args.length === 1 && typeof args[0] === 'string'), JSON.stringify(_calls));
+    });
+
+    it('should complete the queue when the host logger throws', async () => {
+      delete require.cache[require.resolve('../cqueue.js')];
+      const _fresh = require('../cqueue.js');
+      delete require.cache[require.resolve('../cqueue.js')];
+      _fresh.setLogFunction(() => { throw new Error('logger down'); });
+      const { results, errors } = await _fresh.execQueue('throwing-logger', ['ok', 'bad'], (el, next) => (el === 'bad' ? next(new Error('boom')) : next(null, el)),
+        { logQueueStatus: true, retry: 1, logDir: tmpLogDir() });
+      assert.deepStrictEqual(results, ['ok']);
+      assert.strictEqual(errors.length, 1);
+    });
+  });
+
+  describe('errorFile option', () => {
+    it('should never write the errors file when false, the summary is still logged', async () => {
+      const _dir = tmpLogDir();
+      const { errors } = await execQueueP('no-error-file', ['bad'], (el, next) => next(new Error('boom')), silentOptions({ retry: 1, logDir: _dir, errorFile: false }));
+      assert.strictEqual(errors.length, 1);
+      assert.deepStrictEqual(fs.readdirSync(_dir), []);
+      assert.strictEqual(entriesOf('log_file').length, 0);
+      assert.strictEqual(entriesOf('queue_errors').length, 2);
+      assert.strictEqual(entriesOf('queue_errors')[1].fields.summary, '"Error: boom" x1');
+      /** No file to check: the end line does not point to one */
+      assert.strictEqual(entriesOf('queue_failed')[0].msg, '[no-error-file] END - Stop retrying');
+    });
+
+    it('should still write the logs file when errorFile is false', async () => {
+      const _dir = tmpLogDir();
+      await execQueueP('logs-only', ['bad'], (el, next) => next(new Error('boom'), null, { logs: ['kept'] }), silentOptions({ retry: 0, logDir: _dir, errorFile: false }));
+      const _files = fs.readdirSync(_dir);
+      assert.strictEqual(_files.length, 1);
+      assert.ok(_files[0].endsWith('-logs-only-logs.json'), _files[0]);
+    });
+
+    it('should write only the errors file of the last round with \'final\'', async () => {
+      const _dir = tmpLogDir();
+      await execQueueP('final-file', ['bad1', 'bad2'], (el, next) => next(new Error('boom')), silentOptions({ retry: 2, logDir: _dir, errorFile: 'final' }));
+      const _files = fs.readdirSync(_dir);
+      assert.strictEqual(_files.length, 1);
+      assert.ok(_files[0].endsWith('-final-file-errors-try2.json'), _files[0]);
+      assert.strictEqual(JSON.parse(fs.readFileSync(path.join(_dir, _files[0]), 'utf8')).length, 2);
+      assert.strictEqual(entriesOf('queue_failed')[0].msg, '[final-file] END - Stop retrying, check the error file!');
+    });
+
+    it('should write no errors file with \'final\' when the retry recovers', async () => {
+      const _dir = tmpLogDir();
+      let _calls = 0;
+      const { errors } = await execQueueP('final-recover', ['a'], (el, next) => next(++_calls === 1 ? new Error('once') : null, el), silentOptions({ retry: 1, logDir: _dir, errorFile: 'final' }));
+      assert.deepStrictEqual(errors, []);
+      assert.deepStrictEqual(fs.readdirSync(_dir), []);
+    });
+
+    it('should write the errors file of the only round with \'final\' and no retry', async () => {
+      const _dir = tmpLogDir();
+      await execQueueP('final-noretry', ['bad'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir, errorFile: 'final' }));
+      assert.strictEqual(fs.readdirSync(_dir).length, 1);
+    });
+
+    it('should read errorFile from setDefaultOptions', async () => {
+      const _dir = tmpLogDir();
+      setDefaultOptions({ errorFile: false, logDir: _dir });
+      await execQueueP('default-no-file', ['bad'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0 }));
+      assert.deepStrictEqual(fs.readdirSync(_dir), []);
+      /** The option of the call wins */
+      await execQueueP('call-file', ['bad'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, errorFile: true }));
+      assert.strictEqual(fs.readdirSync(_dir).length, 1);
+    });
+  });
+
+  describe('retryDelay option', () => {
+    it('should wait an exponential delay before each retry round', async () => {
+      const _rounds = [];
+      const _start = Date.now();
+      await execQueueP('retry-delay', ['bad'], (el, next) => { _rounds.push(Date.now() - _start); next(new Error('boom')); },
+        silentOptions({ retry: 2, retryDelay: 30, errorFile: false }));
+      assert.deepStrictEqual(entriesOf('queue_retry').map(e => e.fields.delay_ms), [30, 60]);
+      assert.strictEqual(_rounds.length, 3);
+      /** Timers can fire a little early on some platforms: 1ms of tolerance */
+      assert.ok(_rounds[1] - _rounds[0] >= 29, `first retry after ${_rounds[1] - _rounds[0]}ms`);
+      assert.ok(_rounds[2] - _rounds[1] >= 59, `second retry after ${_rounds[2] - _rounds[1]}ms`);
+    });
+
+    it('should not wait without retryDelay, nor with an invalid value', async () => {
+      for (const _retryDelay of [undefined, 0, -100, 'abc', NaN, null]) {
+        _capturedEntries = [];
+        await execQueueP('retry-nodelay', ['bad'], (el, next) => next(new Error('boom')), silentOptions({ retry: 1, retryDelay: _retryDelay, errorFile: false }));
+        assert.strictEqual(entriesOf('queue_retry')[0].fields.delay_ms, 0, String(_retryDelay));
+      }
+    });
+
+    it('should cap the delay to 60 seconds', async () => {
+      /** Long timers are shortened to 0ms while recording the requested duration */
+      const _requested = [];
+      const _setTimeout = global.setTimeout;
+      global.setTimeout = (fn, ms, ...args) => {
+        if (ms >= 1000) {
+          _requested.push(ms);
+          ms = 0;
+        }
+        return _setTimeout(fn, ms, ...args);
+      };
+      try {
+        await execQueueP('retry-cap', ['bad'], (el, next) => next(new Error('boom')), silentOptions({ retry: 3, retryDelay: 25000, errorFile: false }));
+        await execQueueP('retry-infinite', ['bad'], (el, next) => next(new Error('boom')), silentOptions({ retry: 1, retryDelay: Infinity, errorFile: false }));
+      } finally {
+        global.setTimeout = _setTimeout;
+      }
+      assert.deepStrictEqual(_requested, [25000, 50000, 60000, 60000]);
+      assert.deepStrictEqual(entriesOf('queue_retry').map(e => e.fields.delay_ms), [25000, 50000, 60000, 60000]);
+    });
+
+    it('should read retryDelay from setDefaultOptions', async () => {
+      setDefaultOptions({ retryDelay: 15 });
+      await execQueueP('default-retry-delay', ['bad'], (el, next) => next(new Error('boom')), silentOptions({ retry: 1, errorFile: false }));
+      assert.strictEqual(entriesOf('queue_retry')[0].fields.delay_ms, 15);
+    });
+  });
+
+  describe('log injection', () => {
+    it('should keep the error summary on a single line and quote each message as JSON', async () => {
+      await execQueueP('inject', ['a'], (el, next) => next(new Error('bad\r\nERROR [inject] forged "line" \x85\\')), silentOptions({ retry: 0, errorFile: false }));
+      const [_errors] = entriesOf('queue_errors');
+      assert.strictEqual(_errors.msg, '[inject] 1 errors: "Error: bad  ERROR [inject] forged \\"line\\"  \\\\" x1');
+      assert.strictEqual(_errors.fields.summary, '"Error: bad  ERROR [inject] forged \\"line\\"  \\\\" x1');
+    });
+
+    it('should neutralize the control characters of the queue name in messages and fields', async () => {
+      await execQueueP('evil\nWARN [x] forged\x1b[2J', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 1, errorFile: false }));
+      assert.ok(_capturedEntries.length >= 4);
+      for (const _entry of _capturedEntries) {
+        assert.ok(!/[\x00-\x1f]/.test(_entry.msg), JSON.stringify(_entry.msg));
+        assert.strictEqual(_entry.fields.queue, 'evil WARN [x] forged [2J');
+      }
+    });
+
+    it('should keep the crash message and its error field on a single line', async () => {
+      const _err = await withInternalError(() => execQueueP('crash-inject', ['a'], (el, next) => next(null, el), silentOptions()), 'bad\nERROR forged').catch(e => e);
+      assert.strictEqual(_err, '[crash-inject] Error: Promise All Catched: TypeError: bad ERROR forged');
+      const [_crash] = entriesOf('queue_crash');
+      assert.strictEqual(_crash.msg, _err);
+      assert.strictEqual(_crash.fields.error, 'TypeError: bad ERROR forged');
+    });
+
+    it('should keep the full error message in the error file', async () => {
+      const _dir = tmpLogDir();
+      await execQueueP('inject-file', ['a'], (el, next) => next(new Error('multi\nline')), silentOptions({ retry: 0, logDir: _dir }));
+      const _content = JSON.parse(fs.readFileSync(path.join(_dir, fs.readdirSync(_dir)[0]), 'utf8'));
+      assert.deepStrictEqual(_content, [{ element: 'a', message: 'Error: multi\nline' }]);
+    });
+  });
+
+  describe('callback that throws', () => {
+    /** The throw is not caught: it rejects the promise returned by execQueue, exactly like a throw
+     * in the callback of a successful run, and the callback is never called a second time */
+    for (const [_title, _worker, _options] of [
+      ['remaining errors', (el, next) => next(new Error('boom')), { retry: 0 }],
+      ['remaining errors after a retry round', (el, next) => next(new Error('boom')), { retry: 1 }],
+      ['success', (el, next) => next(null, el), { retry: 0 }]
+    ]) {
+      it(`should call the callback once and propagate its throw (${_title})`, async () => {
+        let _calls = 0;
+        const _promise = execQueue('cb-throws', ['a'], _worker, silentOptions(Object.assign({ errorFile: false }, _options)), () => {
+          _calls += 1;
+          throw new Error('user bug');
+        });
+        await assert.rejects(_promise, /user bug/);
+        assert.strictEqual(_calls, 1);
+        assert.strictEqual(entriesOf('queue_crash').length, 0);
+      });
+    }
+  });
+
+  describe('file name collisions', () => {
+    it('should keep both files of two runs of the same queue in the same second', async () => {
+      const _dir = tmpLogDir();
+      const _fail = (el, next) => next(new Error('boom'));
+      await Promise.all([
+        execQueueP('twin', ['a'], _fail, silentOptions({ retry: 0, logDir: _dir })),
+        execQueueP('twin', ['b'], _fail, silentOptions({ retry: 0, logDir: _dir }))
+      ]);
+      const _files = fs.readdirSync(_dir);
+      assert.strictEqual(_files.length, 2, _files.join(','));
+      const _elements = _files.map(f => JSON.parse(fs.readFileSync(path.join(_dir, f), 'utf8'))[0].element).sort();
+      assert.deepStrictEqual(_elements, ['a', 'b']);
+      assert.strictEqual(entriesOf('log_file_error').length, 0);
+    });
+
+    it('should write under a unique name when the name is already taken', async () => {
+      const _dir = tmpLogDir();
+      for (let i = 0; i < 3; i++) {
+        const _stamp = new Date(Date.now() + i * 1000).toISOString().replace(/:/g, '-').slice(0, 19);
+        fs.writeFileSync(path.join(_dir, `${_stamp}-taken-errors.json`), 'PREVIOUS');
+      }
+      await execQueueP('taken', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir }));
+      const [_file] = entriesOf('log_file');
+      assert.match(path.basename(_file.fields.path), new RegExp(`^.{19}-taken-errors-${process.pid}-\\d+\\.json$`));
+      assert.strictEqual(JSON.parse(fs.readFileSync(_file.fields.path, 'utf8')).length, 1);
+      /** The existing files are untouched */
+      assert.strictEqual(fs.readdirSync(_dir).filter(f => fs.readFileSync(path.join(_dir, f), 'utf8') === 'PREVIOUS').length, 3);
+    });
+
+    it('should apply the retention to the files with a unique suffix', async () => {
+      const _dir = tmpLogDir();
+      const _old = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().replace(/:/g, '-').slice(0, 19);
+      const _expired = [`${_old}-ret-errors-123-4.json`, `${_old}-ret-errors-try1-123-5.json`];
+      const _kept = [`${_old}-ret-errors-x.json`, `${_old}-other-ret-errors-123-4.json`];
+      for (const _name of [..._expired, ..._kept]) {
+        fs.writeFileSync(path.join(_dir, _name), '[]');
+      }
+      await execQueueP('ret', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir, logRetentionDays: 7 }));
+      const _files = fs.readdirSync(_dir);
+      for (const _name of _expired) {
+        assert.ok(!_files.includes(_name), _name);
+      }
+      for (const _name of _kept) {
+        assert.ok(_files.includes(_name), _name);
+      }
+    });
+  });
+
+  describe('file write failures', () => {
+    it('should stop serializing and not announce the file when the stream fails', async () => {
+      const _dir = tmpLogDir();
+      const _createWriteStream = fs.createWriteStream;
+      /** Every write fails, like a full disk */
+      fs.createWriteStream = (...args) => {
+        const _stream = _createWriteStream(...args);
+        _stream._write = (chunk, encoding, cb) => cb(new Error('ENOSPC: no space left on device'));
+        return _stream;
+      };
+      let _serialized = 0;
+      const _logs = Array.from({ length: 5000 }, () => ({ toJSON () { _serialized += 1; return 1; } }));
+      try {
+        await execQueueP('disk-full', ['a'], (el, next) => next(new Error('boom'), null, { logs: _logs }), silentOptions({ retry: 0, logDir: _dir }));
+      } finally {
+        fs.createWriteStream = _createWriteStream;
+      }
+      /** The first chunk only, not the 10 chunks of the content */
+      assert.ok(_serialized < _logs.length, `${_serialized} entries serialized`);
+      assert.deepStrictEqual(entriesOf('log_file_error').map(e => e.fields.label), ['logs', 'errors']);
+      assert.strictEqual(entriesOf('log_file').length, 0);
+      assert.strictEqual(entriesOf('queue_failed')[0].msg, '[disk-full] END - Stop retrying');
+    });
+  });
+
+  describe('queue name', () => {
+    it('should accept a number as queue name', async () => {
+      const _dir = tmpLogDir();
+      const { errors } = await execQueueP(42, ['a'], (el, next) => next(new Error('boom'), null, { logs: ['x'] }), silentOptions({ retry: 0, logDir: _dir, logRetentionDays: 1 }));
+      assert.strictEqual(errors.length, 1);
+      assert.deepStrictEqual(fs.readdirSync(_dir).map(f => f.slice(20)).sort(), ['42-errors.json', '42-logs.json']);
+      assert.strictEqual(entriesOf('queue_errors')[0].msg, '[42] 1 errors: "Error: boom" x1');
+      assert.strictEqual(entriesOf('queue_crash').length, 0);
+    });
+  });
+
+  describe('async logger', () => {
+    it('should not leave an unhandled rejection when the logger returns a rejected promise', async () => {
+      delete require.cache[require.resolve('../cqueue.js')];
+      const _fresh = require('../cqueue.js');
+      delete require.cache[require.resolve('../cqueue.js')];
+      const _unhandled = [];
+      const _onUnhandled = (reason) => _unhandled.push(reason);
+      process.on('unhandledRejection', _onUnhandled);
+      try {
+        _fresh.setLogFunction(async () => { throw new Error('async logger down'); });
+        const { errors } = await _fresh.execQueue('async-logger', ['bad'], (el, next) => next(new Error('boom')), { logQueueStatus: true, retry: 1, logDir: tmpLogDir() });
+        assert.strictEqual(errors.length, 1);
+        /** unhandledRejection is emitted after the microtask queue drains */
+        await new Promise(resolve => setTimeout(resolve, 20));
+      } finally {
+        process.removeListener('unhandledRejection', _onUnhandled);
+      }
+      assert.deepStrictEqual(_unhandled, []);
+    });
+  });
+
+  describe('hardening', () => {
+    /** Run execQueue and watch for an uncaught exception or an unhandled rejection meanwhile */
+    async function withoutStrayErrors (fn) {
+      const _stray = [];
+      const _onStray = (err) => _stray.push(err);
+      process.on('unhandledRejection', _onStray);
+      process.on('uncaughtException', _onStray);
+      try {
+        const _res = await fn();
+        await new Promise(resolve => setTimeout(resolve, 20));
+        assert.deepStrictEqual(_stray, []);
+        return _res;
+      } finally {
+        process.removeListener('unhandledRejection', _onStray);
+        process.removeListener('uncaughtException', _onStray);
+      }
+    }
+
+    it('should record an error that cannot be converted to a string, from a sync or an async worker', async () => {
+      const _throwingToString = { toString () { throw new Error('no string'); } };
+      for (const _async of [false, true]) {
+        for (const _err of [Object.create(null), _throwingToString]) {
+          const { results, errors } = await withoutStrayErrors(() => execQueueP('bad-error', ['a', 'b'], (el, next) => {
+            const _done = () => (el === 'a' ? next(_err) : next(null, el));
+            return _async ? setImmediate(_done) : _done();
+          }, silentOptions({ retry: 0, errorFile: false })));
+          assert.deepStrictEqual(results, ['b']);
+          assert.deepStrictEqual(errors, [{ element: 'a', message: 'Unknown error' }]);
+        }
+      }
+    });
+
+    it('should finish the element when the actions getters throw', async () => {
+      const _actions = { get logs () { throw new Error('getter'); } };
+      const { results, errors } = await withoutStrayErrors(() => execQueueP('bad-actions', [1, 2], (el, next) => next(el === 1 ? new Error('boom') : null, el, _actions), silentOptions({ retry: 0, errorFile: false })));
+      assert.deepStrictEqual(results, [1, 2]);
+      /** The message is read before the throwing getter: it is kept */
+      assert.deepStrictEqual(errors, [{ element: 1, message: 'Error: boom' }]);
+    });
+
+    it('should fall back to the default retry for a non-numeric or infinite value', async () => {
+      for (const _retry of [NaN, 'abc', {}, Infinity, -1]) {
+        let _calls = 0;
+        const { errors } = await execQueueP('bad-retry', ['x'], (el, next) => { _calls += 1; return next(new Error('boom')); }, silentOptions({ retry: _retry, errorFile: false }));
+        assert.strictEqual(errors.length, 1);
+        /** Default retry: 1, so two executions */
+        assert.strictEqual(_calls, 2, String(_retry));
+      }
+    });
+
+    it('should yield to the event loop between retry rounds of a synchronous failing worker', async () => {
+      let _ticked = false;
+      let _tickedDuringRetries = false;
+      setImmediate(() => { _ticked = true; });
+      await execQueueP('retry-yield', ['x'], (el, next) => {
+        _tickedDuringRetries = _tickedDuringRetries || _ticked;
+        return next(new Error('boom'));
+      }, silentOptions({ retry: 3, errorFile: false }));
+      assert.strictEqual(_tickedDuringRetries, true);
+    });
+
+    it('should fall back to the defaults for an invalid delay, retryDelay or logRetentionDays', async () => {
+      const _dir = tmpLogDir();
+      fs.writeFileSync(path.join(_dir, '2000-01-01T00-00-00-bad-numbers-errors.json'), '[]');
+      const { results, errors } = await execQueueP('bad-numbers', [1, 2, 'x'], (el, next) => (el === 'x' ? next(new Error('boom')) : next(null, el)),
+        silentOptions({ retry: 1, delay: 'abc', retryDelay: {}, logRetentionDays: NaN, logDir: _dir, logEnabled: true }));
+      assert.deepStrictEqual(results, [1, 2]);
+      assert.strictEqual(errors.length, 1);
+      assert.strictEqual(entriesOf('queue_start')[0].fields.delay, 0);
+      assert.strictEqual(entriesOf('queue_retry')[0].fields.delay_ms, 0);
+      /** logRetentionDays falls back to 0: every file is kept */
+      assert.ok(fs.existsSync(path.join(_dir, '2000-01-01T00-00-00-bad-numbers-errors.json')));
+    });
+
+    it('should process every element with an invalid concurrency', async () => {
+      for (const _concurrency of [NaN, 'abc', {}, Infinity, -3]) {
+        const { results } = await withoutStrayErrors(() => execQueueP('bad-concurrency', [1, 2, 3], (el, next) => next(null, el), silentOptions({ concurrency: _concurrency })));
+        assert.deepStrictEqual(results, [1, 2, 3], String(_concurrency));
+      }
+    });
+
+    it('should never start more queues than elements', async () => {
+      const { results } = await execQueueP('huge-concurrency', [1, 2, 3], (el, next) => next(null, el), { logEnabled: false, logQueueStatus: true, concurrency: 20000 });
+      assert.deepStrictEqual(results, [1, 2, 3]);
+      assert.strictEqual(entriesOf('queue_progress').at(-1).fields.queues, 3);
+    });
+
+    it('should print the status without a TTY every 10% of the round, whatever the number of queues', async () => {
+      const _list = Array.from({ length: 5000 }, (_, i) => i);
+      const { results } = await execQueueP('many-queues', _list, (el, next) => next(null, el), { logEnabled: false, logQueueStatus: true, concurrency: 5000 });
+      assert.strictEqual(results.length, 5000);
+      const _progress = entriesOf('queue_progress');
+      /** One block per 10% step plus the final one, instead of one per queue reaching 100% */
+      assert.ok(_progress.length <= 12, `got ${_progress.length} status prints`);
+      assert.strictEqual(_progress.at(-1).fields.percent, 100);
+    });
+
+    it('should create the files readable by the owner only, and a new log directory private', async () => {
+      const _dir = path.join(tmpLogDir(), 'new');
+      await execQueueP('private-files', [{ password: 's3cret' }], (el, next) => next(new Error('boom'), null, { logs: ['token'] }), silentOptions({ retry: 0, logDir: _dir }));
+      assert.strictEqual(fs.statSync(_dir).mode & 0o777, 0o700);
+      const _files = fs.readdirSync(_dir);
+      assert.strictEqual(_files.length, 2);
+      for (const _file of _files) {
+        assert.strictEqual(fs.statSync(path.join(_dir, _file)).mode & 0o777, 0o600, _file);
+      }
+      /** An existing directory is left as it is */
+      const _existing = tmpLogDir();
+      fs.chmodSync(_existing, 0o755);
+      await execQueueP('existing-dir', ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _existing }));
+      assert.strictEqual(fs.statSync(_existing).mode & 0o777, 0o755);
+    });
+
+    it('should return invalid arguments through the callback, or reject in promise mode', async () => {
+      const _nullName = Object.create(null);
+      for (const [_name, _list, _options] of [['q', null, {}], ['q', 42, {}], ['q', [1], { logDir: {} }], [_nullName, [1], {}]]) {
+        const _err = await withoutStrayErrors(() => new Promise(resolve => {
+          execQueue(_name, _list, (el, next) => next(null, el), silentOptions(_options), (err) => resolve(err));
+        }));
+        assert.ok(_err instanceof TypeError, String(_err));
+        await assert.rejects(execQueue(_name, _list, (el, next) => next(null, el), silentOptions(_options)), TypeError);
+      }
+    });
+
+    it('should not let the caller forge the internal keys', async () => {
+      const { results } = await execQueueP('forged-keys', [1], (el, next) => next(null, el),
+        { logQueueStatus: false, _cqueue: true, try: 3, results: ['injected'], concurrency: 'abc' });
+      assert.deepStrictEqual(results, [1]);
+      assert.strictEqual(entriesOf('queue_start')[0].msg, '[forged-keys] START - 1 total elements - 1 queue(s) - 0ms delay - 0/1 retrie(s)');
+    });
+
+    it('should keep the current logger when setLogFunction receives a non-function', async () => {
+      delete require.cache[require.resolve('../cqueue.js')];
+      const _fresh = require('../cqueue.js');
+      delete require.cache[require.resolve('../cqueue.js')];
+      const _messages = [];
+      _fresh.setLogFunction((msg) => _messages.push(msg));
+      _fresh.setLogFunction('not a function');
+      await _fresh.execQueue('kept-logger', [1], (el, next) => next(null, el), { logQueueStatus: false });
+      assert.ok(_messages.some(m => m.startsWith('[kept-logger] END')), _messages.join('|'));
+    });
+
+    it('should replace the bidi controls of the queue name in the logs', async () => {
+      await execQueueP('a‎b‏c‪d‮e⁦f⁩g', [1], (el, next) => next(null, el), { logQueueStatus: false });
+      assert.strictEqual(entriesOf('queue_start')[0].fields.queue, 'a b c d e f g');
+    });
+
+    it('should truncate a long queue name in the file name', async () => {
+      const _dir = tmpLogDir();
+      const { errors } = await execQueueP('x'.repeat(100000), ['a'], (el, next) => next(new Error('boom')), silentOptions({ retry: 0, logDir: _dir, logRetentionDays: 1 }));
+      assert.strictEqual(errors.length, 1);
+      assert.strictEqual(entriesOf('log_file_error').length, 0);
+      const _files = fs.readdirSync(_dir);
+      assert.strictEqual(_files.length, 1);
+      assert.match(_files[0], /^.{19}-x{200}-errors\.json$/);
     });
   });
 });
